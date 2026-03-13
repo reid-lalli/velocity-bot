@@ -16,7 +16,8 @@ Commands (prefix !):
     !update              — rebuild derived sheets from all logged wars
         !undo                — undo the last mutating command
         !redo                — redo the last undone command
-  !trackstats [code]  — all track stats, or one track (e.g. !trackstats rAF)
+    !trackstats [code|min_played]  — all tracks, one track (e.g. !trackstats rAF), or tracks played at least N times (e.g. !trackstats 3)
+    !reactionmatch      — reconcile slot reactions to current Pacific hour (manual catch-up)
   !warstats [n]       — last n wars (default 5)
   !setupsheets        — (re)init sheet headers  [admin only]
 """
@@ -1360,6 +1361,77 @@ async def cmd_react(ctx: commands.Context):
     )
 
 
+@bot.command(name="reactionmatch")
+async def cmd_reactionmatch(ctx: commands.Context):
+    """
+    Manually reconcile tracked slot reactions to the current Pacific hour.
+    Useful if the hourly scheduler missed a cleanup window.
+    """
+    global REACTION_SLOTS
+    global REACTION_CONFIG
+
+    # If scheduler channel is not configured, default to current channel.
+    if not isinstance(REACTION_CONFIG.get("channel_id"), int):
+        REACTION_CONFIG["channel_id"] = ctx.channel.id
+        REACTION_CONFIG["start_hour"] = int(REACTION_CONFIG.get("start_hour", DEFAULT_REACT_START_HOUR))
+        REACTION_CONFIG["end_hour"] = int(REACTION_CONFIG.get("end_hour", DEFAULT_REACT_END_HOUR))
+        REACTION_CONFIG["last_posted_date"] = ""
+        save_reaction_config(REACTION_CONFIG)
+
+    _mark_runtime_mutation("reactionmatch")
+
+    now_pt = datetime.now(PT_TZ)
+    posted = await _ensure_daily_reaction_slots(now_pt)
+
+    if not REACTION_SLOTS:
+        await ctx.send(
+            "No active slot messages found. Configure with `!reactsetup` and run `!react` or `!reactionmatch` again."
+        )
+        return
+
+    valid_slots: list[dict[str, int]] = []
+    missing = 0
+    for slot in REACTION_SLOTS:
+        msg = await _fetch_message_from_slot(slot, strict=True)
+        if msg is None:
+            missing += 1
+            continue
+        valid_slots.append(slot)
+
+    if missing > 0:
+        REACTION_SLOTS = valid_slots
+        save_reaction_slots(REACTION_SLOTS)
+
+    current_hour = now_pt.hour
+    added = 0
+    cleared = 0
+    for slot in REACTION_SLOTS:
+        msg = await _fetch_message_from_slot(slot)
+        if msg is None:
+            continue
+
+        slot_hour = slot.get("hour")
+        if isinstance(slot_hour, int) and slot_hour < current_hour:
+            cleared += await _clear_default_reactions(msg)
+        else:
+            added += await _add_default_reactions(msg)
+
+    expired = 0
+    for slot in REACTION_SLOTS:
+        slot_hour = slot.get("hour")
+        if isinstance(slot_hour, int) and slot_hour < current_hour:
+            expired += 1
+    active_or_upcoming = max(0, len(REACTION_SLOTS) - expired)
+
+    await ctx.send(
+        f"✅ Reaction match complete (Pacific `{now_pt.strftime('%I:%M %p')}`). "
+        f"Posted new slot messages: `{posted}`. "
+        f"Cleared `{cleared}` reactions for `{expired}` expired slots, and ensured `{added}` reactions "
+        f"across `{active_or_upcoming}` active/upcoming slots."
+        f"{f' Pruned `{missing}` deleted/missing tracked slots.' if missing > 0 else ''}"
+    )
+
+
 @bot.command(name="reactstatus")
 async def cmd_reactstatus(ctx: commands.Context):
     """Show scheduler config and active daily slot messages."""
@@ -1662,24 +1734,68 @@ async def cmd_warend(ctx: commands.Context, vy_score: Optional[int] = None, opp_
         await ctx.send(f"❌ Failed to export war: `{exc}`")
 
 
+def _clean_command_arg(arg: Optional[str]) -> str:
+    """Normalize Discord command args by removing hidden/formatting characters."""
+    if arg is None:
+        return ""
+    cleaned = str(arg)
+    cleaned = cleaned.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ")
+    cleaned = cleaned.strip().strip("`").strip().strip('"').strip("'").strip()
+    return cleaned
+
+
+def _parse_nonnegative_int_arg(arg: Optional[str]) -> Optional[int]:
+    """Parse a command arg as a non-negative integer, returning None when not numeric."""
+    cleaned = _clean_command_arg(arg).replace(",", "")
+    if not cleaned:
+        return None
+    if not re.fullmatch(r"\d+", cleaned):
+        return None
+    try:
+        return int(cleaned)
+    except ValueError:
+        return None
+
+
+def _normalize_track_token(value: Optional[str]) -> str:
+    """Normalize track-like tokens for resilient comparisons."""
+    cleaned = _clean_command_arg(value)
+    canonical = _canonical_track_code(cleaned)
+    if canonical:
+        return canonical.upper()
+    return cleaned.upper()
+
+
 @bot.command(name="trackstats")
-async def cmd_trackstats(ctx: commands.Context, track: Optional[str] = None):
+async def cmd_trackstats(ctx: commands.Context, arg: Optional[str] = None):
     """
     Show track stats.
-    • !trackstats         — all tracks sorted by net total
+    • !trackstats         — all tracks sorted by average gain per race
     • !trackstats rAF     — stats for a specific track
+    • !trackstats 3       — only tracks played at least 3 times
     """
     try:
         spreadsheet = get_spreadsheet()
         ts = spreadsheet.worksheet("Track Stats")
         records = ts.get_all_records()
+        arg_clean = _clean_command_arg(arg)
+        min_played_arg = _parse_nonnegative_int_arg(arg_clean)
 
         if not records:
             await ctx.send("No track data logged yet.")
             return
 
-        if track:
-            match = next((r for r in records if str(r["Track"]).lower() == track.lower()), None)
+        if arg_clean and min_played_arg is None:
+            track = arg_clean
+            track_norm = _normalize_track_token(track)
+            match = next(
+                (
+                    r
+                    for r in records
+                    if _normalize_track_token(str(r.get("Track", ""))) == track_norm
+                ),
+                None,
+            )
             if not match:
                 await ctx.send(f"Track `{track}` not found in the stats sheet.")
                 return
@@ -1693,6 +1809,17 @@ async def cmd_trackstats(ctx: commands.Context, track: Optional[str] = None):
             embed.add_field(name="Worst Score",  value=match.get("Worst Score", "N/A"), inline=True)
             await ctx.send(embed=embed)
         else:
+            min_played = min_played_arg or 0
+            if min_played > 0:
+                records = [r for r in records if int(r.get("Times Played", 0)) >= min_played]
+
+            if not records:
+                if min_played > 0:
+                    await ctx.send(f"No tracks found with at least `{min_played}` plays.")
+                else:
+                    await ctx.send("No track data logged yet.")
+                return
+
             records_sorted = sorted(records, key=lambda r: float(r.get("Avg per Race", 0)), reverse=True)
             lines = ["```", f"{'Track':<8}  {'Played':>6}  {'Net':>6}  {'Avg':>6}", "─" * 32]
             for r in records_sorted:
