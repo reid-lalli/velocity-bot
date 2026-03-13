@@ -610,6 +610,37 @@ async def _delete_previous_day_slot_messages(channel_id: int, now_pt: datetime, 
     return deleted, failed
 
 
+async def _delete_bot_messages_in_channel(channel_id: int, limit: int = 2000) -> tuple[int, int]:
+    """Delete recent messages authored by this bot in one channel."""
+    channel = await _get_channel_by_id(channel_id)
+    if channel is None or bot.user is None:
+        return 0, 0
+
+    history_fn = getattr(channel, "history", None)
+    if not callable(history_fn):
+        return 0, 0
+
+    history_iter = history_fn(limit=limit)
+    if not hasattr(history_iter, "__aiter__"):
+        return 0, 0
+
+    deleted = 0
+    failed = 0
+    for_delete_iter = cast(AsyncIterator[discord.Message], history_iter)
+    async for message in for_delete_iter:
+        if message.author.id != bot.user.id:
+            continue
+        try:
+            result = message.delete()
+            if asyncio.iscoroutine(result):
+                await result
+            deleted += 1
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+    return deleted, failed
+
+
 async def _ensure_daily_reaction_slots(now_pt: datetime) -> int:
     """Ensure today's slot messages exist; post a new daily set when needed."""
     date_key = now_pt.strftime("%Y-%m-%d")
@@ -1654,6 +1685,33 @@ async def cmd_reactdelete(ctx: commands.Context):
     await ctx.send(
         f"🗑️ React test cleanup complete. Deleted `{deleted}` slot messages "
         f"(`{failed}` missing/failed). Run `!react` to repost today's test slots."
+    )
+
+
+@bot.command(name="reactreset")
+async def cmd_reactreset(ctx: commands.Context):
+    """Delete this channel's bot messages and repost today's gather slot messages."""
+    global REACTION_SLOTS
+    global REACTION_CONFIG
+
+    _mark_runtime_mutation("reactreset")
+
+    REACTION_CONFIG["channel_id"] = ctx.channel.id
+    REACTION_CONFIG["start_hour"] = int(REACTION_CONFIG.get("start_hour", DEFAULT_REACT_START_HOUR))
+    REACTION_CONFIG["end_hour"] = int(REACTION_CONFIG.get("end_hour", DEFAULT_REACT_END_HOUR))
+    REACTION_CONFIG["last_posted_date"] = ""
+    save_reaction_config(REACTION_CONFIG)
+
+    deleted, failed = await _delete_bot_messages_in_channel(ctx.channel.id)
+
+    REACTION_SLOTS = [slot for slot in REACTION_SLOTS if slot.get("channel_id") != ctx.channel.id]
+    save_reaction_slots(REACTION_SLOTS)
+
+    posted = await _post_daily_reaction_slots(datetime.now(PT_TZ))
+
+    await ctx.send(
+        f"✅ React reset complete. Deleted `{deleted}` bot messages in this channel"
+        f"{f' (`{failed}` failed)' if failed > 0 else ''} and posted `{posted}` new gather slots for today."
     )
 
 
