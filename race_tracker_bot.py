@@ -29,7 +29,7 @@ import time
 import json
 import copy
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, AsyncIterator, cast
 from zoneinfo import ZoneInfo
 
 import discord
@@ -567,6 +567,49 @@ async def _delete_tracked_slot_messages(channel_id: Optional[int] = None) -> tup
     return deleted, failed, len(target_slots)
 
 
+async def _delete_previous_day_slot_messages(channel_id: int, now_pt: datetime, limit: int = 500) -> tuple[int, int]:
+    """Best-effort cleanup for old bot-posted slot messages from prior Pacific dates."""
+    channel = await _get_channel_by_id(channel_id)
+    if channel is None or bot.user is None:
+        return 0, 0
+
+    history_fn = getattr(channel, "history", None)
+    if not callable(history_fn):
+        return 0, 0
+
+    deleted = 0
+    failed = 0
+    today_pt = now_pt.date()
+
+    history_iter = history_fn(limit=limit)
+    if not hasattr(history_iter, "__aiter__"):
+        return 0, 0
+
+    for_delete_iter = cast(AsyncIterator[discord.Message], history_iter)
+    async for message in for_delete_iter:
+        # Only touch messages posted by this bot.
+        if message.author.id != bot.user.id:
+            continue
+
+        # Only touch messages that look like scheduler slot posts.
+        if _parse_timeslot_hour_from_message(message) is None:
+            continue
+
+        message_date_pt = message.created_at.astimezone(PT_TZ).date()
+        if message_date_pt >= today_pt:
+            continue
+
+        try:
+            result = message.delete()
+            if asyncio.iscoroutine(result):
+                await result
+            deleted += 1
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+    return deleted, failed
+
+
 async def _ensure_daily_reaction_slots(now_pt: datetime) -> int:
     """Ensure today's slot messages exist; post a new daily set when needed."""
     date_key = now_pt.strftime("%Y-%m-%d")
@@ -580,6 +623,9 @@ async def _ensure_daily_reaction_slots(now_pt: datetime) -> int:
     # New day detected: clear prior tracked slot messages before posting today's set.
     if REACTION_SLOTS:
         await _delete_tracked_slot_messages(channel_id)
+
+    # Fallback sweep: remove any older bot slot messages still in channel history.
+    await _delete_previous_day_slot_messages(channel_id, now_pt)
 
     return await _post_daily_reaction_slots(now_pt)
 
