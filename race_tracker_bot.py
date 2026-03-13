@@ -530,6 +530,43 @@ async def _post_daily_reaction_slots(now_pt: datetime) -> int:
     return posted
 
 
+async def _delete_tracked_slot_messages(channel_id: Optional[int] = None) -> tuple[int, int, int]:
+    """Delete tracked slot messages (optionally scoped to one channel) and prune slot state."""
+    global REACTION_SLOTS
+
+    if channel_id is None:
+        target_slots = list(REACTION_SLOTS)
+        remaining_slots: list[dict[str, int]] = []
+    else:
+        target_slots = [slot for slot in REACTION_SLOTS if slot.get("channel_id") == channel_id]
+        remaining_slots = [slot for slot in REACTION_SLOTS if slot.get("channel_id") != channel_id]
+
+    deleted = 0
+    failed = 0
+    for slot in target_slots:
+        msg = await _fetch_message_from_slot(slot)
+        if msg is None:
+            failed += 1
+            continue
+
+        delete_fn = getattr(msg, "delete", None)
+        if not callable(delete_fn):
+            failed += 1
+            continue
+
+        try:
+            result = delete_fn()
+            if asyncio.iscoroutine(result):
+                await result
+            deleted += 1
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            failed += 1
+
+    REACTION_SLOTS = remaining_slots
+    save_reaction_slots(REACTION_SLOTS)
+    return deleted, failed, len(target_slots)
+
+
 async def _ensure_daily_reaction_slots(now_pt: datetime) -> int:
     """Ensure today's slot messages exist; post a new daily set when needed."""
     date_key = now_pt.strftime("%Y-%m-%d")
@@ -539,6 +576,10 @@ async def _ensure_daily_reaction_slots(now_pt: datetime) -> int:
 
     if REACTION_CONFIG.get("last_posted_date") == date_key and REACTION_SLOTS:
         return 0
+
+    # New day detected: clear prior tracked slot messages before posting today's set.
+    if REACTION_SLOTS:
+        await _delete_tracked_slot_messages(channel_id)
 
     return await _post_daily_reaction_slots(now_pt)
 
