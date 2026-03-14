@@ -1823,19 +1823,15 @@ async def on_ready():
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user:
-        await bot.process_commands(message)
         return
 
     # In active manual war sessions, support Quaxly-like commandless race input.
     handled_shorthand = await _handle_war_shorthand_message(message)
-    if handled_shorthand:
-        await bot.process_commands(message)
-        return
 
-    text = _extract_war_text_from_message(message)
-
-    if AUTO_LOG_RESULTS and "Total Score after Race" in text:
-        await _log_war(message.channel, text)
+    if not handled_shorthand:
+        text = _extract_war_text_from_message(message)
+        if AUTO_LOG_RESULTS and "Total Score after Race" in text:
+            await _log_war(message.channel, text)
 
     await bot.process_commands(message)
 
