@@ -1,0 +1,6 @@
+.env
+credentials.json
+__pycache__/
+.venv/
+reaction_slots.json
+reaction_schedule_config.json

@@ -1,0 +1,44 @@
+name: Deploy Bot to VM
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure SSH key
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          echo "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+
+      - name: Add VM to known hosts
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh-keyscan -p "${{ secrets.VM_PORT || '22' }}" -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy latest code and restart service
+        shell: bash
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.VM_PORT || '22' }}" "${{ secrets.VM_USER }}@${{ secrets.VM_HOST }}" '
+            set -euo pipefail
+            APP_DIR="${{ secrets.VM_APP_DIR }}"
+            SERVICE_NAME="${{ secrets.VM_SERVICE_NAME }}"
+            if [ -z "$SERVICE_NAME" ]; then
+              SERVICE_NAME="vybot"
+            fi
+
+            cd "$APP_DIR"
+            git fetch origin main
+            git pull --ff-only origin main
+            sudo systemctl restart "$SERVICE_NAME"
+            sudo systemctl --no-pager --full status "$SERVICE_NAME" | head -n 25
+          '

@@ -28,6 +28,7 @@ import asyncio
 import time
 import json
 import copy
+import math
 from datetime import datetime
 from typing import Optional, Dict, Any, AsyncIterator, cast
 from zoneinfo import ZoneInfo
@@ -94,6 +95,10 @@ REACTION_SLOTS_FILE = "reaction_slots.json"
 REACTION_CONFIG_FILE = "reaction_schedule_config.json"
 DEFAULT_REACT_START_HOUR = 9
 DEFAULT_REACT_END_HOUR = 22
+PICK_OWNER_OURS = "ours"
+PICK_OWNER_THEIRS = "theirs"
+PICK_RECO_MIN_SAMPLES = 5
+PICK_HIGH_CONF_SAMPLES = 10
 
 
 def _canonical_track_code(track: str) -> Optional[str]:
@@ -892,8 +897,17 @@ def _get_or_create_redo_ws(spreadsheet, source_title: str, rows=1000, cols=30) -
 
 def backup_state(spreadsheet, action: str):
     """Create a one-step backup snapshot used by !undo."""
-    war_log, track_stats, race_details, war_track_summary, net_tracker = setup_headers(spreadsheet)
-    sources = [war_log, track_stats, race_details, war_track_summary, net_tracker]
+    (
+        war_log,
+        track_stats,
+        race_details,
+        war_track_summary,
+        net_tracker,
+        pick_analytics,
+        pick_board,
+        pick_splits,
+    ) = setup_headers(spreadsheet)
+    sources = [war_log, track_stats, race_details, war_track_summary, net_tracker, pick_analytics, pick_board, pick_splits]
 
     for src in sources:
         dst = _get_or_create_undo_ws(spreadsheet, src.title, rows=max(1000, src.row_count), cols=max(30, src.col_count))
@@ -916,8 +930,17 @@ def backup_state(spreadsheet, action: str):
 
 def backup_redo_state(spreadsheet, action: str):
     """Create a one-step backup snapshot used by !redo after !undo."""
-    war_log, track_stats, race_details, war_track_summary, net_tracker = setup_headers(spreadsheet)
-    sources = [war_log, track_stats, race_details, war_track_summary, net_tracker]
+    (
+        war_log,
+        track_stats,
+        race_details,
+        war_track_summary,
+        net_tracker,
+        pick_analytics,
+        pick_board,
+        pick_splits,
+    ) = setup_headers(spreadsheet)
+    sources = [war_log, track_stats, race_details, war_track_summary, net_tracker, pick_analytics, pick_board, pick_splits]
 
     for src in sources:
         dst = _get_or_create_redo_ws(spreadsheet, src.title, rows=max(1000, src.row_count), cols=max(30, src.col_count))
@@ -1006,6 +1029,76 @@ def _to_int(value) -> Optional[int]:
         return int(str(value).strip())
     except (TypeError, ValueError):
         return None
+
+
+def _normalize_pick_owner(value: Optional[str]) -> Optional[str]:
+    """Normalize pick-side values to 'ours' or 'theirs'."""
+    token = str(value).strip().lower() if value not in (None, "") else ""
+    if token in {"1", "our", "ours", "us", "vy", "v"}:
+        return PICK_OWNER_OURS
+    if token in {"2", "their", "theirs", "opp", "opponent", "enemy", "e"}:
+        return PICK_OWNER_THEIRS
+    return None
+
+
+def _pick_owner_to_flag(owner: Optional[str]) -> str:
+    """Convert normalized owner to compact sheet flag values."""
+    if owner == PICK_OWNER_OURS:
+        return "1"
+    if owner == PICK_OWNER_THEIRS:
+        return "2"
+    return ""
+
+
+def _parse_pick_spot(value) -> Optional[int]:
+    """Parse pick spot number (1-12), or None when absent/invalid."""
+    parsed = _to_int(value)
+    if parsed is None:
+        return None
+    if 1 <= parsed <= 12:
+        return parsed
+    return None
+
+
+def _infer_pick_spot_from_previous_race(session: dict, race_number: int) -> Optional[int]:
+    """Infer pick spot from the prior race by using our best finishing position."""
+    if race_number <= 1:
+        return None
+    prev_race = session.get("races", {}).get(race_number - 1)
+    if not isinstance(prev_race, dict):
+        return None
+    positions = prev_race.get("positions", [])
+    if not isinstance(positions, list) or not positions:
+        return None
+    valid_positions = [p for p in positions if isinstance(p, int) and 1 <= p <= 12]
+    if not valid_positions:
+        return None
+    return min(valid_positions)
+
+
+def _parse_bulk_pick_token(token: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
+    """Parse one bulk !pick token into (race_num, race1_spot, error)."""
+    value = (token or "").strip().lower()
+    if not value:
+        return None, None, "empty token"
+
+    # Race 1 with shorthand positions after @/:, e.g. 1@34589 -> [3,4,5,8,9,12] -> spot 3.
+    with_shorthand = re.fullmatch(r"(?:r|race|id)?1(?:@|:)([0-9+\-]{2,12})", value)
+    if with_shorthand:
+        positions = _parse_positions_shorthand(with_shorthand.group(1))
+        if not positions:
+            return None, None, f"invalid Race 1 shorthand '{with_shorthand.group(1)}'"
+        return 1, min(positions), None
+
+    # Plain race number, optionally prefixed with r/race/id (e.g. 3, r3, race3, id3)
+    plain = re.fullmatch(r"(?:r|race|id)?(\d{1,2})", value)
+    if plain:
+        race_num = int(plain.group(1))
+        if race_num < 1:
+            return None, None, f"invalid race '{race_num}'"
+        return race_num, None, None
+
+    return None, None, f"could not parse token '{token}'"
 
 
 def _is_datetime_like(value) -> bool:
@@ -1143,9 +1236,321 @@ def _normalize_war_log_layout(war_log: gspread.Worksheet):
     war_log.append_rows(migrated_rows)
 
 
+def _apply_war_log_pick_highlights(
+    war_log: gspread.Worksheet,
+    war_records: list[dict],
+    race_details_records: list[dict],
+):
+    """Color War Log race net cells green for races marked as our pick."""
+    if not war_records:
+        return
+
+    ours_by_war_and_race: dict[int, set[int]] = {}
+    for record in race_details_records:
+        war_id = _to_int(record.get("War ID"))
+        race_num = _to_int(record.get("Race #"))
+        owner = _normalize_pick_owner(str(record.get("Pick Owner", "")))
+        if war_id is None or race_num is None or owner != PICK_OWNER_OURS:
+            continue
+        ours_by_war_and_race.setdefault(war_id, set()).add(race_num)
+
+    # Reset net-cell backgrounds first to avoid stale highlights after edits.
+    war_log.format(
+        f"G2:R{len(war_records) + 1}",
+        {"backgroundColor": {"red": 1, "green": 1, "blue": 1}},
+    )
+
+    for row_num, record in enumerate(war_records, start=2):
+        war_id = _to_int(record.get("War ID"))
+        if war_id is None:
+            continue
+        for race_num in ours_by_war_and_race.get(war_id, set()):
+            if race_num < 1 or race_num > 12:
+                continue
+            col = _column_letter(6 + race_num)
+            war_log.format(
+                f"{col}{row_num}",
+                {"backgroundColor": {"red": 0.85, "green": 0.96, "blue": 0.85}},
+            )
+
+
+def _parse_record_datetime(value: Any) -> Optional[datetime]:
+    """Parse sheet date values stored as 'YYYY-MM-DD HH:MM'."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _avg(values: list[int]) -> float:
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
+def _std_dev(values: list[int]) -> float:
+    if len(values) < 2:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) ** 2 for value in values) / len(values)
+    return round(math.sqrt(variance), 2)
+
+
+def _trend_from_windows(avg_30: Optional[float], avg_60: Optional[float]) -> str:
+    """Return up/down/flat trend from 30d vs 60d averages."""
+    if avg_30 is None or avg_60 is None:
+        return "n/a"
+    delta = avg_30 - avg_60
+    if delta >= 1:
+        return "up"
+    if delta <= -1:
+        return "down"
+    return "flat"
+
+
+def _build_pick_samples(race_details_records: list[dict]) -> list[dict[str, Any]]:
+    """Normalize Race Details rows into samples used by analytics tables."""
+    samples: list[dict[str, Any]] = []
+    for record in race_details_records:
+        owner = _normalize_pick_owner(str(record.get("Pick Owner", "")))
+        track = str(record.get("Track", "")).strip()
+        opponent = str(record.get("Opponent", "")).strip().upper()
+        net = _to_int(record.get("Net Score"))
+        if owner is None or not track or not opponent or net is None:
+            continue
+
+        samples.append({
+            "date": _parse_record_datetime(record.get("Date")),
+            "owner": owner,
+            "opponent": opponent,
+            "track": track,
+            "spot": _parse_pick_spot(record.get("Pick Spot")),
+            "net": int(net),
+        })
+    return samples
+
+
+def _compute_pick_metrics(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Compute advanced metrics for our picks grouped by track + spot."""
+    now = datetime.now()
+    ours_by_track_spot: dict[tuple[str, int], list[dict[str, Any]]] = {}
+    ours_by_track: dict[str, list[int]] = {}
+    theirs_by_track: dict[str, list[int]] = {}
+
+    for sample in samples:
+        owner = sample["owner"]
+        track = sample["track"]
+        net = int(sample["net"])
+        if owner == PICK_OWNER_THEIRS:
+            theirs_by_track.setdefault(track, []).append(net)
+            continue
+        if owner != PICK_OWNER_OURS:
+            continue
+
+        spot = sample.get("spot")
+        if spot is None:
+            continue
+        ours_by_track.setdefault(track, []).append(net)
+        ours_by_track_spot.setdefault((track, int(spot)), []).append(sample)
+
+    metrics: list[dict[str, Any]] = []
+    for (track, spot), grouped in ours_by_track_spot.items():
+        nets = [int(sample["net"]) for sample in grouped]
+        plays = len(nets)
+        net_total = sum(nets)
+        avg_net = _avg(nets)
+        ours_track_avg = _avg(ours_by_track.get(track, []))
+        opp_track_values = theirs_by_track.get(track, [])
+        opp_track_avg = _avg(opp_track_values) if opp_track_values else None
+        pick_advantage = round(avg_net - opp_track_avg, 2) if opp_track_avg is not None else None
+        delta_vs_our_track = round(avg_net - ours_track_avg, 2)
+
+        recent_30 = [
+            int(sample["net"])
+            for sample in grouped
+            if isinstance(sample.get("date"), datetime) and (now - sample["date"]).days <= 30
+        ]
+        recent_60 = [
+            int(sample["net"])
+            for sample in grouped
+            if isinstance(sample.get("date"), datetime) and (now - sample["date"]).days <= 60
+        ]
+        avg_30 = _avg(recent_30) if recent_30 else None
+        avg_60 = _avg(recent_60) if recent_60 else None
+        trend = _trend_from_windows(avg_30, avg_60)
+
+        std_dev = _std_dev(nets)
+        consistency = round(max(0.0, 100 - (std_dev * 12)), 1)
+
+        if plays < PICK_RECO_MIN_SAMPLES:
+            confidence = "low"
+        elif plays >= PICK_HIGH_CONF_SAMPLES and std_dev <= 6:
+            confidence = "high"
+        else:
+            confidence = "medium"
+
+        if plays < PICK_RECO_MIN_SAMPLES:
+            recommendation = f"Low sample: need {PICK_RECO_MIN_SAMPLES}+ picks"
+        elif pick_advantage is not None and pick_advantage >= 2 and delta_vs_our_track >= 1:
+            recommendation = "Strong pick: high edge vs opponent"
+        elif pick_advantage is not None and pick_advantage <= -2:
+            recommendation = "Weak pick: opponent does better here"
+        elif trend == "down":
+            recommendation = "Cooling off: monitor recent form"
+        else:
+            recommendation = "Playable: stable long-term"
+
+        metrics.append({
+            "track": track,
+            "spot": int(spot),
+            "plays": plays,
+            "net_total": net_total,
+            "avg_net": avg_net,
+            "ours_track_avg": ours_track_avg,
+            "opp_track_avg": opp_track_avg,
+            "pick_advantage": pick_advantage,
+            "avg_30": avg_30,
+            "avg_60": avg_60,
+            "trend": trend,
+            "std_dev": std_dev,
+            "consistency": consistency,
+            "confidence": confidence,
+            "best": max(nets),
+            "worst": min(nets),
+            "recommendation": recommendation,
+        })
+
+    metrics.sort(
+        key=lambda metric: (
+            metric["avg_30"] if metric["avg_30"] is not None else metric["avg_net"],
+            metric["pick_advantage"] if metric["pick_advantage"] is not None else -999,
+            metric["plays"],
+        ),
+        reverse=True,
+    )
+    return metrics
+
+
+def _build_pick_analytics_rows(metrics: list[dict[str, Any]]) -> list[list[Any]]:
+    """Render track+spot metrics into rows for Track Pick Analytics sheet."""
+    rows: list[list[Any]] = []
+    for metric in metrics:
+        rows.append([
+            metric["track"],
+            metric["spot"],
+            metric["plays"],
+            metric["net_total"],
+            metric["avg_net"],
+            metric["ours_track_avg"],
+            metric["opp_track_avg"] if metric["opp_track_avg"] is not None else "",
+            metric["pick_advantage"] if metric["pick_advantage"] is not None else "",
+            metric["avg_30"] if metric["avg_30"] is not None else "",
+            metric["avg_60"] if metric["avg_60"] is not None else "",
+            metric["trend"],
+            metric["std_dev"],
+            metric["consistency"],
+            metric["confidence"],
+            metric["best"],
+            metric["worst"],
+            metric["recommendation"],
+        ])
+    return rows
+
+
+def _build_pick_board_rows(metrics: list[dict[str, Any]]) -> list[list[Any]]:
+    """Build ranked recommendations for the best current pick options."""
+    candidates = [metric for metric in metrics if metric["plays"] >= PICK_RECO_MIN_SAMPLES]
+    ranked: list[tuple[float, dict[str, Any]]] = []
+    for metric in candidates:
+        expected = metric["avg_30"] if metric["avg_30"] is not None else metric["avg_net"]
+        trend_bonus = 0.6 if metric["trend"] == "up" else (-0.6 if metric["trend"] == "down" else 0.0)
+        confidence_bonus = {"low": 0.0, "medium": 0.3, "high": 0.6}.get(metric["confidence"], 0.0)
+        pick_adv = metric["pick_advantage"] if metric["pick_advantage"] is not None else 0.0
+        score = expected + (pick_adv * 0.6) + trend_bonus + confidence_bonus - (metric["std_dev"] / 10)
+        ranked.append((score, metric))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    rows: list[list[Any]] = []
+    for rank, (score, metric) in enumerate(ranked[:10], start=1):
+        expected = metric["avg_30"] if metric["avg_30"] is not None else metric["avg_net"]
+        rows.append([
+            rank,
+            metric["track"],
+            metric["spot"],
+            round(expected, 2),
+            metric["pick_advantage"] if metric["pick_advantage"] is not None else "",
+            metric["confidence"],
+            metric["trend"],
+            metric["plays"],
+            round(score, 2),
+            metric["recommendation"],
+        ])
+    return rows
+
+
+def _build_pick_split_rows(samples: list[dict[str, Any]]) -> list[list[Any]]:
+    """Build filterable split rows by opponent team + pick owner + track + spot."""
+    now = datetime.now()
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for sample in samples:
+        spot = sample.get("spot")
+        key = (
+            str(sample["opponent"]),
+            str(sample["owner"]),
+            str(sample["track"]),
+            str(spot) if spot is not None else "",
+        )
+        grouped.setdefault(key, []).append(sample)
+
+    rows: list[list[Any]] = []
+    for (opponent, owner, track, spot), grouped_samples in grouped.items():
+        nets = [int(sample["net"]) for sample in grouped_samples]
+        recent_30 = [
+            int(sample["net"])
+            for sample in grouped_samples
+            if isinstance(sample.get("date"), datetime) and (now - sample["date"]).days <= 30
+        ]
+        recent_60 = [
+            int(sample["net"])
+            for sample in grouped_samples
+            if isinstance(sample.get("date"), datetime) and (now - sample["date"]).days <= 60
+        ]
+        avg_30 = _avg(recent_30) if recent_30 else None
+        avg_60 = _avg(recent_60) if recent_60 else None
+        rows.append([
+            opponent,
+            owner,
+            track,
+            spot,
+            len(nets),
+            sum(nets),
+            _avg(nets),
+            _std_dev(nets),
+            avg_30 if avg_30 is not None else "",
+            avg_60 if avg_60 is not None else "",
+            _trend_from_windows(avg_30, avg_60),
+        ])
+
+    rows.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+    return rows
+
+
 def refresh_summary_sheets(spreadsheet):
     """Rebuild derived sheets from War Log and sort Track Stats by Avg per Race descending."""
-    war_log, track_stats, race_details, war_track_summary, net_tracker = setup_headers(spreadsheet)
+    (
+        war_log,
+        track_stats,
+        race_details,
+        war_track_summary,
+        net_tracker,
+        pick_analytics,
+        pick_board,
+        pick_splits,
+    ) = setup_headers(spreadsheet)
     _repair_war_log_rows(war_log, race_details)
     ensure_war_ids(war_log)
 
@@ -1157,6 +1562,9 @@ def refresh_summary_sheets(spreadsheet):
     _clear_data_rows(track_stats)
     _clear_data_rows(war_track_summary)
     _clear_data_rows(net_tracker)
+    _clear_data_rows(pick_analytics)
+    _clear_data_rows(pick_board)
+    _clear_data_rows(pick_splits)
 
     track_totals: dict[str, dict] = {}
     summary_rows = []
@@ -1212,9 +1620,25 @@ def refresh_summary_sheets(spreadsheet):
     if net_rows:
         net_tracker.append_rows(net_rows)
 
+    race_details_records = race_details.get_all_records()
+    _apply_war_log_pick_highlights(war_log, war_records, race_details_records)
+
+    pick_samples = _build_pick_samples(race_details_records)
+    metrics = _compute_pick_metrics(pick_samples)
+    pick_rows = _build_pick_analytics_rows(metrics)
+    board_rows = _build_pick_board_rows(metrics)
+    split_rows = _build_pick_split_rows(pick_samples)
+
+    if pick_rows:
+        pick_analytics.append_rows(pick_rows)
+    if board_rows:
+        pick_board.append_rows(board_rows)
+    if split_rows:
+        pick_splits.append_rows(split_rows)
+
 
 def setup_headers(spreadsheet) -> tuple:
-    """Ensure all three sheets exist with correct headers. Returns (war_log, track_stats, race_details)."""
+    """Ensure all primary/analytics sheets exist with correct headers."""
     # War Log ─────────────────────────────────────────────────────────────────
     wl = _get_or_create_ws(spreadsheet, "War Log")
     if not wl.row_values(1):
@@ -1235,10 +1659,12 @@ def setup_headers(spreadsheet) -> tuple:
     # Race Details ───────────────────────────────────────────────────────────
     rd = _get_or_create_ws(spreadsheet, "Race Details")
     if not rd.row_values(1):
-        rd.append_row(["Date", "Opponent", "Race #", "Net Score", "Vy Positions", "Track", "War ID"])
-        rd.format("A1:G1", {"textFormat": {"bold": True}})
+        rd.append_row(["Date", "Opponent", "Race #", "Net Score", "Vy Positions", "Track", "War ID", "Pick Owner", "Pick Spot"])
+        rd.format("A1:I1", {"textFormat": {"bold": True}})
     else:
         _ensure_header_column(rd, "War ID")
+        _ensure_header_column(rd, "Pick Owner")
+        _ensure_header_column(rd, "Pick Spot")
 
     # War Track Summary ──────────────────────────────────────────────────────
     wts = _get_or_create_ws(spreadsheet, "War Track Summary", rows=1000, cols=5)
@@ -1257,13 +1683,81 @@ def setup_headers(spreadsheet) -> tuple:
     else:
         _ensure_header_column(net_tracker, "War ID")
 
-    return wl, ts, rd, wts, net_tracker
+    # Track Pick Analytics ────────────────────────────────────────────────────
+    pick_analytics = _get_or_create_ws(spreadsheet, "Track Pick Analytics", rows=1000, cols=18)
+    if not pick_analytics.row_values(1):
+        pick_analytics.append_row([
+            "Track",
+            "Pick Spot",
+            "Times Picked",
+            "Net Total",
+            "Avg Net",
+            "Our Track Avg (All Spots)",
+            "Opp Track Avg (When They Pick)",
+            "Pick Advantage vs Opp",
+            "Last 30d Avg",
+            "Last 60d Avg",
+            "Trend",
+            "Std Dev",
+            "Consistency",
+            "Confidence",
+            "Best",
+            "Worst",
+            "Recommendation",
+        ])
+        pick_analytics.format("A1:Q1", {"textFormat": {"bold": True}})
+
+    # Pick Board ──────────────────────────────────────────────────────────────
+    pick_board = _get_or_create_ws(spreadsheet, "Track Pick Board", rows=300, cols=10)
+    if not pick_board.row_values(1):
+        pick_board.append_row([
+            "Rank",
+            "Track",
+            "Pick Spot",
+            "Expected Net",
+            "Pick Advantage vs Opp",
+            "Confidence",
+            "Trend",
+            "Times Picked",
+            "Board Score",
+            "Recommendation",
+        ])
+        pick_board.format("A1:J1", {"textFormat": {"bold": True}})
+
+    # Pick Splits (filterable by team + pick owner) ──────────────────────────
+    pick_splits = _get_or_create_ws(spreadsheet, "Track Pick Splits", rows=2000, cols=11)
+    if not pick_splits.row_values(1):
+        pick_splits.append_row([
+            "Opponent",
+            "Pick Owner",
+            "Track",
+            "Pick Spot",
+            "Times",
+            "Net Total",
+            "Avg Net",
+            "Std Dev",
+            "Last 30d Avg",
+            "Last 60d Avg",
+            "Trend",
+        ])
+        pick_splits.format("A1:K1", {"textFormat": {"bold": True}})
+
+    return wl, ts, rd, wts, net_tracker, pick_analytics, pick_board, pick_splits
 
 
 def write_war(war: dict):
     """Write a parsed war dict to all five Google Sheets."""
     spreadsheet = get_spreadsheet()
-    war_log, _track_stats, race_details, _war_track_summary, _net_tracker = setup_headers(spreadsheet)
+    (
+        war_log,
+        _track_stats,
+        race_details,
+        _war_track_summary,
+        _net_tracker,
+        _pick_analytics,
+        _pick_board,
+        _pick_splits,
+    ) = setup_headers(spreadsheet)
     ensure_war_ids(war_log)
     existing_wars = war_log.get_all_records()
     next_war_id = max((_to_int(record.get("War ID")) or 0 for record in existing_wars), default=0) + 1
@@ -1297,6 +1791,8 @@ def write_war(war: dict):
             ", ".join(str(p) for p in r["positions"]),
             r["track"],
             war["war_id"],
+            _pick_owner_to_flag(_normalize_pick_owner(r.get("pick_owner"))),
+            r.get("pick_spot", "") if _parse_pick_spot(r.get("pick_spot")) is not None else "",
         ]
         for r in war["races"]
     ]
@@ -1784,12 +2280,102 @@ async def cmd_warset(ctx: commands.Context, race: int, net: int, track: str, pos
         "net": computed_net,
         "track": canonical_track,
         "positions": positions,
+        "pick_owner": None,
+        "pick_spot": None,
     }
     session.pop("pending_track", None)
     war_preview = _session_as_war_dict(session)
     await ctx.send(
         f"✅ Set race `{race}` on `{track.strip()}` with `{positions_csv}` -> net `{computed_net:+d}`{net_note}\n"
         f"```\n{_format_war_summary_text(war_preview)}\n```"
+    )
+
+
+@bot.command(name="pick")
+async def cmd_pick(ctx: commands.Context, *, picks: Optional[str] = None):
+    """
+    Bulk-set track pick ownership for the active war session.
+    The races you list are treated as OUR picks; all others become OPP picks.
+    Race 1 spot is only needed when race 1 is one of our picks.
+
+    Usage:
+      !pick 2 4 6
+      !pick r2 r4 r6
+            !pick id2 id4 id6
+        !pick 1@34589 3 5  (Race 1 shorthand -> spot 3)
+                !pick id1@34589 id3 id5
+        !pick 1:34589 3 5
+    """
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS.get(channel_id)
+    if not session:
+        await ctx.send("No active war in this channel.")
+        return
+
+    if not session["races"]:
+        await ctx.send("No races in this session yet. Add races first with `!warset` or shorthand.")
+        return
+
+    if not picks or not picks.strip():
+        await ctx.send(
+            "Usage: `!pick <our_races...>` where listed races are OUR picks and all others are OPP picks.\n"
+            "Examples: `!pick 2 4 6` or `!pick 1@34589 3 5` (Race 1 shorthand)."
+        )
+        return
+
+    entered_tokens = [t for t in re.split(r"[\s,]+", picks.strip()) if t]
+    ours_races: set[int] = set()
+    race1_spot: Optional[int] = None
+    max_race = max(session["races"].keys())
+
+    for token in entered_tokens:
+        race_num, spot_for_r1, err = _parse_bulk_pick_token(token)
+        if err:
+            await ctx.send(
+                f"Could not parse `{token}`. Use race numbers like `2 4 6` (or `id2 id4`) and Race 1 shorthand like `1@34589`."
+            )
+            return
+        if race_num is None:
+            continue
+        if race_num not in session["races"]:
+            await ctx.send(f"Race `{race_num}` is not set in this session. Current highest race is `{max_race}`.")
+            return
+        ours_races.add(race_num)
+        if race_num == 1 and spot_for_r1 is not None:
+            race1_spot = spot_for_r1
+
+    if not ours_races:
+        await ctx.send("No valid races provided. Example: `!pick 2 4 6` or `!pick 1@34589 3 5`.")
+        return
+
+    if 1 in ours_races and race1_spot is None:
+        await ctx.send("Race 1 is marked as our pick; include shorthand like `1@34589` (or `1:34589`).")
+        return
+
+    _mark_runtime_mutation("pick")
+    auto_filled: list[int] = []
+    for race_num in sorted(session["races"]):
+        race_data = session["races"][race_num]
+        if race_num in ours_races:
+            race_data["pick_owner"] = PICK_OWNER_OURS
+            if race_num == 1:
+                race_data["pick_spot"] = race1_spot
+            else:
+                inferred_spot = _infer_pick_spot_from_previous_race(session, race_num)
+                race_data["pick_spot"] = inferred_spot
+                if inferred_spot is not None:
+                    auto_filled.append(race_num)
+        else:
+            race_data["pick_owner"] = PICK_OWNER_THEIRS
+            race_data["pick_spot"] = None
+
+    opp_races = sorted(r for r in session["races"] if r not in ours_races)
+    ours_text = ", ".join(str(r) for r in sorted(ours_races))
+    opp_text = ", ".join(str(r) for r in opp_races) if opp_races else "none"
+    auto_text = f" Auto-filled spots from prior races for: `{', '.join(map(str, auto_filled))}`." if auto_filled else ""
+    await ctx.send(
+        f"✅ Pick sides set. OUR picks: `{ours_text}` | OPP picks: `{opp_text}`."
+        f"{f' Race 1 spot: `{race1_spot}`.' if 1 in ours_races and race1_spot is not None else ''}{auto_text}"
     )
 
 
@@ -1818,6 +2404,109 @@ async def cmd_warcancel(ctx: commands.Context):
         await ctx.send("No active war session to cancel.")
 
 
+@bot.command(name="undorace")
+async def cmd_undorace(ctx: commands.Context):
+    """
+    Undo the last race entered in the active war session.
+    Also clears any pending track waiting for shorthand input.
+    Usage: !undorace
+    """
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS.get(channel_id)
+    if not session:
+        await ctx.send("No active war in this channel.")
+        return
+
+    _mark_runtime_mutation("undorace")
+    had_pending = "pending_track" in session
+    session.pop("pending_track", None)
+
+    if not session["races"]:
+        msg = "No races to undo."
+        if had_pending:
+            msg = "Cleared pending track (no races to undo)."
+        await ctx.send(msg)
+        return
+
+    last_race_num = max(session["races"].keys())
+    removed = session["races"].pop(last_race_num)
+
+    if not session["races"]:
+        await ctx.send(
+            f"↩️ Removed race `{last_race_num}` (`{removed['track']}`, net `{removed['net']:+d}`). "
+            "No races remaining."
+        )
+        return
+
+    war_preview = _session_as_war_dict(session)
+    await ctx.send(
+        f"↩️ Removed race `{last_race_num}` (`{removed['track']}`, net `{removed['net']:+d}`)."
+        f"{'  Also cleared pending track.' if had_pending else ''}\n"
+        f"```\n{_format_war_summary_text(war_preview)}\n```"
+    )
+
+
+@bot.command(name="editspots")
+async def cmd_editspots(ctx: commands.Context, race: int, *, spots: str):
+    """
+    Edit the finishing positions for an existing race in the active session.
+    Recalculates net automatically. Accepts CSV or shorthand.
+    Usage:
+      !editspots 3 1,2,4,6,7,9
+      !editspots 3 13468+
+    """
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS.get(channel_id)
+    if not session:
+        await ctx.send("No active war in this channel.")
+        return
+
+    if race not in session["races"]:
+        await ctx.send(f"Race `{race}` not found. Use `!warshow` to see current races.")
+        return
+
+    spots = spots.strip()
+
+    # Try CSV first (contains commas or is all digits/spaces).
+    positions: Optional[list[int]] = None
+    if "," in spots or re.fullmatch(r"[\d\s]+", spots):
+        parsed = []
+        valid = True
+        for token in re.split(r"[,\s]+", spots):
+            if not token:
+                continue
+            if not token.isdigit():
+                valid = False
+                break
+            parsed.append(int(token))
+        if valid and parsed:
+            positions = parsed
+
+    # Fall back to shorthand (e.g. 13478+).
+    if positions is None:
+        positions = _parse_positions_shorthand(spots)
+        if positions is None:
+            await ctx.send(
+                "Could not parse positions. Use CSV like `1,2,4,6,7,9` or shorthand like `13478+`."
+            )
+            return
+
+    net = _calc_net_from_positions(positions)
+    old_net = session["races"][race]["net"]
+    track = session["races"][race]["track"]
+
+    _mark_runtime_mutation("editspots")
+    session["races"][race]["positions"] = positions
+    session["races"][race]["net"] = net
+
+    war_preview = _session_as_war_dict(session)
+    await ctx.send(
+        f"✅ Race `{race}` (`{track}`) positions updated to `{','.join(map(str, positions))}` "
+        f"-> net `{net:+d}` (was `{old_net:+d}`)\n"
+        f"```\n{_format_war_summary_text(war_preview)}\n```"
+    )
+
+
 @bot.command(name="warend")
 async def cmd_warend(ctx: commands.Context, vy_score: Optional[int] = None, opp_score: Optional[int] = None):
     """
@@ -1834,6 +2523,40 @@ async def cmd_warend(ctx: commands.Context, vy_score: Optional[int] = None, opp_
 
     if len(session["races"]) == 0:
         await ctx.send("No race entries were set. Add races with `!warset` first.")
+        return
+
+    missing_pick_side = [r for r in sorted(session["races"]) if _normalize_pick_owner(session["races"][r].get("pick_owner")) is None]
+    if missing_pick_side:
+        joined = ", ".join(str(r) for r in missing_pick_side)
+        await ctx.send(
+            f"Please set pick-side before export for race(s): `{joined}`. "
+            "Use bulk `!pick <our_races...>` (example: `!pick 2 4 6` or `!pick 1@34589 3 5`)."
+        )
+        return
+
+    # Auto-fill our pick spots from the previous race where possible.
+    for race_number in sorted(session["races"]):
+        race_data = session["races"][race_number]
+        if _normalize_pick_owner(race_data.get("pick_owner")) != PICK_OWNER_OURS:
+            continue
+        if _parse_pick_spot(race_data.get("pick_spot")) is not None:
+            continue
+        inferred_spot = _infer_pick_spot_from_previous_race(session, race_number)
+        if inferred_spot is not None:
+            race_data["pick_spot"] = inferred_spot
+
+    missing_ours_spot = [
+        r
+        for r in sorted(session["races"])
+        if _normalize_pick_owner(session["races"][r].get("pick_owner")) == PICK_OWNER_OURS
+        and _parse_pick_spot(session["races"][r].get("pick_spot")) is None
+    ]
+    if missing_ours_spot:
+        joined = ", ".join(str(r) for r in missing_ours_spot)
+        await ctx.send(
+            f"Please set pick spot (1-12) for our pick race(s): `{joined}`. "
+            "Only Race 1 should normally need manual spot. Example: `!pick 1@34589 3 5`."
+        )
         return
 
     war = _session_as_war_dict(session)
@@ -2682,6 +3405,8 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
             "net": net,
             "track": canonical_track,
             "positions": positions,
+            "pick_owner": None,
+            "pick_spot": None,
         }
         try:
             await message.add_reaction("✅")
@@ -2710,6 +3435,8 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
             "net": net,
             "track": track,
             "positions": positions,
+            "pick_owner": None,
+            "pick_spot": None,
         }
         try:
             await message.add_reaction("✅")
@@ -2757,7 +3484,14 @@ def _format_war_summary_text(war: dict) -> str:
     ]
     for race in sorted(war.get("races", []), key=lambda r: r["race"]):
         pos_text = ",".join(str(p) for p in race.get("positions", []))
-        lines.append(f"{race['race']}: {race['net']:+d} | {pos_text} ({race['track']})")
+        owner = _normalize_pick_owner(race.get("pick_owner"))
+        pick_note = ""
+        if owner == PICK_OWNER_OURS:
+            spot = _parse_pick_spot(race.get("pick_spot"))
+            pick_note = f" [1@{spot}]" if spot is not None else " [1]"
+        elif owner == PICK_OWNER_THEIRS:
+            pick_note = " [2]"
+        lines.append(f"{race['race']}: {race['net']:+d} | {pos_text} ({race['track']}){pick_note}")
     return "\n".join(lines)
 
 
