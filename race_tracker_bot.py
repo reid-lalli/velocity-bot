@@ -220,6 +220,7 @@ def save_reaction_config(config: dict[str, Any]):
 
 REACTION_SLOTS: list[dict[str, int]] = load_reaction_slots()
 REACTION_CONFIG: dict[str, Any] = load_reaction_config()
+_REACTION_SCHEDULER_LOCK = asyncio.Lock()
 _LAST_MIDNIGHT_REACT_DATE: Optional[str] = None
 _LAST_CLEANUP_HOUR_KEY: Optional[str] = None
 _RUNTIME_UNDO_SNAPSHOT: Optional[dict[str, Any]] = None
@@ -648,22 +649,24 @@ async def _delete_bot_messages_in_channel(channel_id: int, limit: int = 2000) ->
 
 async def _ensure_daily_reaction_slots(now_pt: datetime) -> int:
     """Ensure today's slot messages exist; post a new daily set when needed."""
-    date_key = now_pt.strftime("%Y-%m-%d")
-    channel_id = REACTION_CONFIG.get("channel_id")
-    if not isinstance(channel_id, int):
-        return 0
+    # Serialize scheduler and command-triggered posting to prevent duplicate daily posts.
+    async with _REACTION_SCHEDULER_LOCK:
+        date_key = now_pt.strftime("%Y-%m-%d")
+        channel_id = REACTION_CONFIG.get("channel_id")
+        if not isinstance(channel_id, int):
+            return 0
 
-    if REACTION_CONFIG.get("last_posted_date") == date_key and REACTION_SLOTS:
-        return 0
+        if REACTION_CONFIG.get("last_posted_date") == date_key and REACTION_SLOTS:
+            return 0
 
-    # New day detected: clear prior tracked slot messages before posting today's set.
-    if REACTION_SLOTS:
-        await _delete_tracked_slot_messages(channel_id)
+        # New day detected: clear prior tracked slot messages before posting today's set.
+        if REACTION_SLOTS:
+            await _delete_tracked_slot_messages(channel_id)
 
-    # Fallback sweep: remove any older bot slot messages still in channel history.
-    await _delete_previous_day_slot_messages(channel_id, now_pt)
+        # Fallback sweep: remove any older bot slot messages still in channel history.
+        await _delete_previous_day_slot_messages(channel_id, now_pt)
 
-    return await _post_daily_reaction_slots(now_pt)
+        return await _post_daily_reaction_slots(now_pt)
 
 
 async def _fetch_message_from_slot(slot: dict[str, int], strict: bool = False) -> Optional[Any]:
@@ -1939,7 +1942,8 @@ async def cmd_react(ctx: commands.Context):
     # If today's slots were deleted, republish today's set and continue.
     reposted = 0
     if valid_slots == []:
-        reposted = await _post_daily_reaction_slots(now_pt)
+        async with _REACTION_SCHEDULER_LOCK:
+            reposted = await _post_daily_reaction_slots(now_pt)
         valid_slots = list(REACTION_SLOTS)
 
     if missing > 0:
@@ -2199,7 +2203,8 @@ async def cmd_reactreset(ctx: commands.Context):
     REACTION_SLOTS = [slot for slot in REACTION_SLOTS if slot.get("channel_id") != ctx.channel.id]
     save_reaction_slots(REACTION_SLOTS)
 
-    posted = await _post_daily_reaction_slots(datetime.now(PT_TZ))
+    async with _REACTION_SCHEDULER_LOCK:
+        posted = await _post_daily_reaction_slots(datetime.now(PT_TZ))
 
     await ctx.send(
         f"✅ React reset complete. Deleted `{deleted}` bot messages in this channel"
