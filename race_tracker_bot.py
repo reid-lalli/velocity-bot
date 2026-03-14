@@ -3509,7 +3509,7 @@ def _best_worst_track_summary(war: dict) -> tuple[str, int, str, int]:
     return best_track, totals[best_track], worst_track, totals[worst_track]
 
 
-@bot.command(name="help")
+@bot.command(name="vyhelp")
 async def cmd_help(ctx: commands.Context):
     """Show all bot commands."""
     msg = (
