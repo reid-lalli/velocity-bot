@@ -3509,6 +3509,57 @@ def _best_worst_track_summary(war: dict) -> tuple[str, int, str, int]:
     return best_track, totals[best_track], worst_track, totals[worst_track]
 
 
+@bot.command(name="help")
+async def cmd_help(ctx: commands.Context):
+    """Show all bot commands."""
+    msg = (
+        "**Vy Bot Commands**\n"
+        "\n"
+        "**War Logging**\n"
+        "`!addwar <paste>` — Manually log a war (paste Quaxly output, or reply to Quaxly message and run `!addwar`)\n"
+        "\n"
+        "**Live War Session**\n"
+        "`!warstart <opponent>` — Start a manual war session\n"
+        "`!warset <race> <net> <track> <positions>` — Set/update one race result (positions as 1,3,4,7,10,12)\n"
+        "`!pick <races...>` — Mark our pick races; use `1@34589` shorthand for race 1\n"
+        "`!editspots <race> <positions>` — Edit finishing positions for a race (recalculates net)\n"
+        "`!undorace` — Remove the last race from the active session\n"
+        "`!warshow` — Preview current session in Quaxly format\n"
+        "`!warcancel` — Cancel/discard the active session\n"
+        "`!warend [vy_score] [opp_score]` — Finalize and export to Sheets\n"
+        "\n"
+        "**Stats**\n"
+        "`!warstats [n]` — Last n wars (default 5)\n"
+        "`!trackstats` — All tracks sorted by avg net\n"
+        "`!trackstats <code>` — One specific track, e.g. `!trackstats rAF`\n"
+        "`!trackstats <n>` — Tracks played at least n times\n"
+        "`!warids [n]` — Recent war IDs\n"
+        "\n"
+        "**Editing Logged Wars**\n"
+        "`!change oppname <name>` — Change opponent name (most recent war)\n"
+        "`!change teamscore <score>` — Change Vy score (most recent war)\n"
+        "`!change oppscore <score>` — Change opp score (most recent war)\n"
+        "`!change <warID> oppname/teamscore/oppscore <value>` — Target specific war by ID\n"
+        "`!deletewar [n]` — Delete nth most recent war (confirm via reaction)\n"
+        "\n"
+        "**Sheets**\n"
+        "`!update` — Rebuild all derived sheets from War Log\n"
+        "`!setupsheets` — Re-init all sheet headers *(admin only)*\n"
+        "`!undo` — Undo last mutating command\n"
+        "`!redo` — Redo last undone command\n"
+        "\n"
+        "**Reaction Schedule**\n"
+        "`!reactsetup [start] [end]` — Configure daily slot posts (Pacific, 24h, default 9–22)\n"
+        "`!react` — Post/sync today's time-slot messages\n"
+        "`!reactionmatch` — Sync reactions to current Pacific hour manually\n"
+        "`!reactstatus` — Show scheduler config and active slots\n"
+        "`!reactreset` — Delete all bot messages and repost today's slots\n"
+        "`!reactdelete` — Delete tracked slot messages\n"
+        "`!reactclear` — Clear reactions and disable scheduler for this channel\n"
+    )
+    await ctx.send(msg)
+
+
 # ── Entry Point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     missing = []
