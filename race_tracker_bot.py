@@ -1063,8 +1063,56 @@ def _parse_pick_spot(value) -> Optional[int]:
     return None
 
 
-def _infer_pick_spot_from_previous_race(session: dict, race_number: int) -> Optional[int]:
-    """Infer pick spot from the prior race by using our best finishing position."""
+def _parse_pick_spots(value) -> Optional[list[int]]:
+    """Parse pick spots into a sorted unique list of positions (1-12)."""
+    if value in (None, ""):
+        return None
+
+    # Already structured list input.
+    if isinstance(value, list):
+        parsed = [int(v) for v in value if isinstance(v, int) and 1 <= int(v) <= 12]
+        unique_sorted = sorted(set(parsed))
+        return unique_sorted or None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    # CSV / whitespace list, e.g. "3,4,5,8,9,12".
+    if "," in text or " " in text:
+        parsed: list[int] = []
+        for token in re.split(r"[,\s]+", text):
+            if not token:
+                continue
+            spot = _parse_pick_spot(token)
+            if spot is None:
+                return None
+            parsed.append(spot)
+        unique_sorted = sorted(set(parsed))
+        return unique_sorted or None
+
+    # Shorthand, e.g. 34589+.
+    if re.fullmatch(r"[0-9+\-]{2,12}", text):
+        shorthand_positions = _parse_positions_shorthand(text)
+        if shorthand_positions:
+            return sorted(set(shorthand_positions))
+
+    single = _parse_pick_spot(text)
+    if single is None:
+        return None
+    return [single]
+
+
+def _pick_spots_to_text(value) -> str:
+    """Render pick spots as comma-separated text for sheet storage/messages."""
+    spots = _parse_pick_spots(value)
+    if not spots:
+        return ""
+    return ",".join(str(s) for s in spots)
+
+
+def _infer_pick_spots_from_previous_race(session: dict, race_number: int) -> Optional[list[int]]:
+    """Infer full pick spots from prior race finishing positions."""
     if race_number <= 1:
         return None
     prev_race = session.get("races", {}).get(race_number - 1)
@@ -1073,25 +1121,31 @@ def _infer_pick_spot_from_previous_race(session: dict, race_number: int) -> Opti
     positions = prev_race.get("positions", [])
     if not isinstance(positions, list) or not positions:
         return None
-    valid_positions = [p for p in positions if isinstance(p, int) and 1 <= p <= 12]
-    if not valid_positions:
+    valid_positions = sorted({p for p in positions if isinstance(p, int) and 1 <= p <= 12})
+    return valid_positions or None
+
+
+def _infer_pick_spot_from_previous_race(session: dict, race_number: int) -> Optional[int]:
+    """Infer pick spot from the prior race by using our best finishing position."""
+    inferred_spots = _infer_pick_spots_from_previous_race(session, race_number)
+    if not inferred_spots:
         return None
-    return min(valid_positions)
+    return min(inferred_spots)
 
 
-def _parse_bulk_pick_token(token: str) -> tuple[Optional[int], Optional[int], Optional[str]]:
-    """Parse one bulk !pick token into (race_num, race1_spot, error)."""
+def _parse_bulk_pick_token(token: str) -> tuple[Optional[int], Optional[list[int]], Optional[str]]:
+    """Parse one bulk !pick token into (race_num, race1_spots, error)."""
     value = (token or "").strip().lower()
     if not value:
         return None, None, "empty token"
 
-    # Race 1 with shorthand positions after @/:, e.g. 1@34589 -> [3,4,5,8,9,12] -> spot 3.
+    # Race 1 with shorthand positions after @/:, e.g. 1@34589 -> [3,4,5,8,9,12].
     with_shorthand = re.fullmatch(r"(?:r|race|id)?1(?:@|:)([0-9+\-]{2,12})", value)
     if with_shorthand:
         positions = _parse_positions_shorthand(with_shorthand.group(1))
         if not positions:
             return None, None, f"invalid Race 1 shorthand '{with_shorthand.group(1)}'"
-        return 1, min(positions), None
+        return 1, sorted(set(positions)), None
 
     # Plain race number, optionally prefixed with r/race/id (e.g. 3, r3, race3, id3)
     plain = re.fullmatch(r"(?:r|race|id)?(\d{1,2})", value)
@@ -1137,6 +1191,22 @@ def _war_from_log_row(record: dict) -> dict:
         "num_races": len(races),
         "races": races,
     }
+
+
+def _war_duplicate_signature(record: dict) -> tuple[Any, ...]:
+    """Build a stable signature for de-duping same war content across rows."""
+    signature: list[Any] = [
+        str(record.get("Date", "")).strip(),
+        str(record.get("Opponent", "")).strip().upper(),
+        _to_int(record.get(f"{CLAN_NAME} Score")),
+        _to_int(record.get("Opp Score")),
+        _to_int(record.get("Net")),
+    ]
+    for race_number in range(1, 13):
+        signature.append(_to_int(record.get(f"R{race_number} Net")))
+    for race_number in range(1, 13):
+        signature.append(str(record.get(f"R{race_number} Track", "")).strip().upper())
+    return tuple(signature)
 
 
 def _repair_war_log_rows(war_log: gspread.Worksheet, race_details: gspread.Worksheet) -> int:
@@ -1322,6 +1392,11 @@ def _build_pick_samples(race_details_records: list[dict]) -> list[dict[str, Any]
         track = str(record.get("Track", "")).strip()
         opponent = str(record.get("Opponent", "")).strip().upper()
         net = _to_int(record.get("Net Score"))
+        spot = _parse_pick_spot(record.get("Pick Spot"))
+        if spot is None:
+            spots = _parse_pick_spots(record.get("Pick Spots"))
+            if spots:
+                spot = min(spots)
         if owner is None or not track or not opponent or net is None:
             continue
 
@@ -1330,7 +1405,7 @@ def _build_pick_samples(race_details_records: list[dict]) -> list[dict[str, Any]
             "owner": owner,
             "opponent": opponent,
             "track": track,
-            "spot": _parse_pick_spot(record.get("Pick Spot")),
+            "spot": spot,
             "net": int(net),
         })
     return samples
@@ -1662,12 +1737,13 @@ def setup_headers(spreadsheet) -> tuple:
     # Race Details ───────────────────────────────────────────────────────────
     rd = _get_or_create_ws(spreadsheet, "Race Details")
     if not rd.row_values(1):
-        rd.append_row(["Date", "Opponent", "Race #", "Net Score", "Vy Positions", "Track", "War ID", "Pick Owner", "Pick Spot"])
-        rd.format("A1:I1", {"textFormat": {"bold": True}})
+        rd.append_row(["Date", "Opponent", "Race #", "Net Score", "Vy Positions", "Track", "War ID", "Pick Owner", "Pick Spot", "Pick Spots"])
+        rd.format("A1:J1", {"textFormat": {"bold": True}})
     else:
         _ensure_header_column(rd, "War ID")
         _ensure_header_column(rd, "Pick Owner")
         _ensure_header_column(rd, "Pick Spot")
+        _ensure_header_column(rd, "Pick Spots")
 
     # War Track Summary ──────────────────────────────────────────────────────
     wts = _get_or_create_ws(spreadsheet, "War Track Summary", rows=1000, cols=5)
@@ -1796,6 +1872,7 @@ def write_war(war: dict):
             war["war_id"],
             _pick_owner_to_flag(_normalize_pick_owner(r.get("pick_owner"))),
             r.get("pick_spot", "") if _parse_pick_spot(r.get("pick_spot")) is not None else "",
+            _pick_spots_to_text(r.get("pick_spots")),
         ]
         for r in war["races"]
     ]
@@ -1828,10 +1905,14 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
 
+    ctx = await bot.get_context(message)
+    is_command_message = bool(ctx.valid)
+
     # In active manual war sessions, support Quaxly-like commandless race input.
     handled_shorthand = await _handle_war_shorthand_message(message)
 
-    if not handled_shorthand:
+    # Avoid double-logging when users run !addwar with pasted war text.
+    if not handled_shorthand and not is_command_message:
         text = _extract_war_text_from_message(message)
         if AUTO_LOG_RESULTS and "Total Score after Race" in text:
             await _log_war(message.channel, text)
@@ -2283,6 +2364,7 @@ async def cmd_warset(ctx: commands.Context, race: int, net: int, track: str, pos
         "positions": positions,
         "pick_owner": None,
         "pick_spot": None,
+        "pick_spots": None,
     }
     session.pop("pending_track", None)
     war_preview = _session_as_war_dict(session)
@@ -2326,11 +2408,11 @@ async def cmd_pick(ctx: commands.Context, *, picks: Optional[str] = None):
 
     entered_tokens = [t for t in re.split(r"[\s,]+", picks.strip()) if t]
     ours_races: set[int] = set()
-    race1_spot: Optional[int] = None
+    race1_spots: Optional[list[int]] = None
     max_race = max(session["races"].keys())
 
     for token in entered_tokens:
-        race_num, spot_for_r1, err = _parse_bulk_pick_token(token)
+        race_num, spots_for_r1, err = _parse_bulk_pick_token(token)
         if err:
             await ctx.send(
                 f"Could not parse `{token}`. Use race numbers like `2 4 6` (or `id2 id4`) and Race 1 shorthand like `1@34589`."
@@ -2342,41 +2424,47 @@ async def cmd_pick(ctx: commands.Context, *, picks: Optional[str] = None):
             await ctx.send(f"Race `{race_num}` is not set in this session. Current highest race is `{max_race}`.")
             return
         ours_races.add(race_num)
-        if race_num == 1 and spot_for_r1 is not None:
-            race1_spot = spot_for_r1
+        if race_num == 1 and spots_for_r1 is not None:
+            race1_spots = spots_for_r1
 
     if not ours_races:
         await ctx.send("No valid races provided. Example: `!pick 2 4 6` or `!pick 1@34589 3 5`.")
         return
 
-    if 1 in ours_races and race1_spot is None:
+    if 1 in ours_races and race1_spots is None:
         await ctx.send("Race 1 is marked as our pick; include shorthand like `1@34589` (or `1:34589`).")
         return
 
     _mark_runtime_mutation("pick")
-    auto_filled: list[int] = []
+    auto_filled: list[tuple[int, list[int]]] = []
     for race_num in sorted(session["races"]):
         race_data = session["races"][race_num]
         if race_num in ours_races:
             race_data["pick_owner"] = PICK_OWNER_OURS
             if race_num == 1:
-                race_data["pick_spot"] = race1_spot
+                race_data["pick_spots"] = race1_spots
+                race_data["pick_spot"] = min(race1_spots) if race1_spots else None
             else:
-                inferred_spot = _infer_pick_spot_from_previous_race(session, race_num)
-                race_data["pick_spot"] = inferred_spot
-                if inferred_spot is not None:
-                    auto_filled.append(race_num)
+                inferred_spots = _infer_pick_spots_from_previous_race(session, race_num)
+                race_data["pick_spots"] = inferred_spots
+                race_data["pick_spot"] = min(inferred_spots) if inferred_spots else None
+                if inferred_spots:
+                    auto_filled.append((race_num, inferred_spots))
         else:
             race_data["pick_owner"] = PICK_OWNER_THEIRS
             race_data["pick_spot"] = None
+            race_data["pick_spots"] = None
 
     opp_races = sorted(r for r in session["races"] if r not in ours_races)
     ours_text = ", ".join(str(r) for r in sorted(ours_races))
     opp_text = ", ".join(str(r) for r in opp_races) if opp_races else "none"
-    auto_text = f" Auto-filled spots from prior races for: `{', '.join(map(str, auto_filled))}`." if auto_filled else ""
+    auto_text = ""
+    if auto_filled:
+        entries = [f"R{race}={_pick_spots_to_text(spots)}" for race, spots in auto_filled]
+        auto_text = f" Auto-filled spots from prior races: `{'; '.join(entries)}`."
     await ctx.send(
         f"✅ Pick sides set. OUR picks: `{ours_text}` | OPP picks: `{opp_text}`."
-        f"{f' Race 1 spot: `{race1_spot}`.' if 1 in ours_races and race1_spot is not None else ''}{auto_text}"
+        f"{f' Race 1 spots: `{_pick_spots_to_text(race1_spots)}`.' if 1 in ours_races and race1_spots is not None else ''}{auto_text}"
     )
 
 
@@ -2540,16 +2628,18 @@ async def cmd_warend(ctx: commands.Context, vy_score: Optional[int] = None, opp_
         race_data = session["races"][race_number]
         if _normalize_pick_owner(race_data.get("pick_owner")) != PICK_OWNER_OURS:
             continue
-        if _parse_pick_spot(race_data.get("pick_spot")) is not None:
+        if _parse_pick_spots(race_data.get("pick_spots")) is not None or _parse_pick_spot(race_data.get("pick_spot")) is not None:
             continue
-        inferred_spot = _infer_pick_spot_from_previous_race(session, race_number)
-        if inferred_spot is not None:
-            race_data["pick_spot"] = inferred_spot
+        inferred_spots = _infer_pick_spots_from_previous_race(session, race_number)
+        if inferred_spots is not None:
+            race_data["pick_spots"] = inferred_spots
+            race_data["pick_spot"] = min(inferred_spots)
 
     missing_ours_spot = [
         r
         for r in sorted(session["races"])
         if _normalize_pick_owner(session["races"][r].get("pick_owner")) == PICK_OWNER_OURS
+        and _parse_pick_spots(session["races"][r].get("pick_spots")) is None
         and _parse_pick_spot(session["races"][r].get("pick_spot")) is None
     ]
     if missing_ours_spot:
@@ -2597,7 +2687,7 @@ async def cmd_warend(ctx: commands.Context, vy_score: Optional[int] = None, opp_
             f"**Total Differential:** {diff:+d}\n"
             f"**Best Track:** {best_track} ({best_net:+d})\n"
             f"**Worst Track:** {worst_track} ({worst_net:+d})\n"
-            f"```\n{_format_war_summary_text(war)}\n```"
+            f"```\n{_format_war_summary_text(war, show_pick_notes=False)}\n```"
         )
     except Exception as exc:
         await ctx.send(f"❌ Failed to export war: `{exc}`")
@@ -3008,6 +3098,81 @@ async def cmd_deletewar(ctx: commands.Context, war_index: int = 1):
         await ctx.send(f"❌ Error: `{exc}`")
 
 
+@bot.command(name="dedupewars")
+async def cmd_dedupewars(ctx: commands.Context, mode: Optional[str] = None):
+    """Remove duplicate wars, or preview what would be removed first."""
+    try:
+        spreadsheet = get_spreadsheet()
+        wl = spreadsheet.worksheet("War Log")
+        rd = spreadsheet.worksheet("Race Details")
+        ensure_war_ids(wl)
+
+        preview_mode = str(mode or "").strip().lower() in {"preview", "dry", "dryrun", "dry-run", "check"}
+
+        wl_records = wl.get_all_records()
+        if not wl_records:
+            await ctx.send("No wars logged yet.")
+            return
+
+        signature_rows: dict[tuple[Any, ...], list[tuple[int, int]]] = {}
+        for row_num, record in enumerate(wl_records, start=2):
+            war_id = _to_int(record.get("War ID"))
+            if war_id is None:
+                continue
+            signature = _war_duplicate_signature(record)
+            signature_rows.setdefault(signature, []).append((row_num, war_id))
+
+        duplicate_row_nums: list[int] = []
+        duplicate_war_ids: list[int] = []
+        for rows in signature_rows.values():
+            if len(rows) <= 1:
+                continue
+            # Keep the oldest (first) row, remove later duplicates.
+            for row_num, war_id in rows[1:]:
+                duplicate_row_nums.append(row_num)
+                duplicate_war_ids.append(war_id)
+
+        if not duplicate_row_nums:
+            await ctx.send("No duplicate wars found.")
+            return
+
+        if preview_mode:
+            duplicate_ids_sorted = sorted(set(duplicate_war_ids))
+            id_preview = ", ".join(str(war_id) for war_id in duplicate_ids_sorted[:15])
+            suffix = "" if len(duplicate_ids_sorted) <= 15 else ", ..."
+            await ctx.send(
+                f"🔎 Preview only: would remove `{len(duplicate_row_nums)}` duplicate war row(s) "
+                f"across `{len(duplicate_ids_sorted)}` war ID(s): `{id_preview}{suffix}`.\n"
+                "Run `!dedupewars` with no args to apply."
+            )
+            return
+
+        run_sheets_with_retry(backup_state, spreadsheet, "dedupewars")
+
+        rd_records = rd.get_all_records()
+        rd_rows_to_delete: list[int] = []
+        duplicate_war_id_set = set(duplicate_war_ids)
+        for row_num, record in enumerate(rd_records, start=2):
+            if _to_int(record.get("War ID")) in duplicate_war_id_set:
+                rd_rows_to_delete.append(row_num)
+
+        for row_num in sorted(rd_rows_to_delete, reverse=True):
+            rd.delete_rows(row_num, row_num)
+        for row_num in sorted(duplicate_row_nums, reverse=True):
+            wl.delete_rows(row_num, row_num)
+
+        run_sheets_with_retry(refresh_summary_sheets, spreadsheet)
+        _mark_sheets_mutation("dedupewars")
+
+        removed_wars = len(duplicate_row_nums)
+        removed_races = len(rd_rows_to_delete)
+        await ctx.send(
+            f"✅ De-dup complete. Removed `{removed_wars}` duplicate war row(s) and `{removed_races}` related race row(s)."
+        )
+    except Exception as exc:
+        await ctx.send(f"❌ Error: `{exc}`")
+
+
 @bot.command(name="warids")
 async def cmd_warids(ctx: commands.Context, n: int = 10):
     """Show recent war IDs so you can target !change by ID."""
@@ -3408,6 +3573,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
             "positions": positions,
             "pick_owner": None,
             "pick_spot": None,
+            "pick_spots": None,
         }
         try:
             await message.add_reaction("✅")
@@ -3438,6 +3604,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
             "positions": positions,
             "pick_owner": None,
             "pick_spot": None,
+            "pick_spots": None,
         }
         try:
             await message.add_reaction("✅")
@@ -3469,7 +3636,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
     return False
 
 
-def _format_war_summary_text(war: dict) -> str:
+def _format_war_summary_text(war: dict, show_pick_notes: bool = True) -> str:
     """Render a Quaxly-style summary block for display in Discord."""
     lines = [
         f"Total Score after Race {war.get('num_races', len(war.get('races', [])))}",
@@ -3485,13 +3652,14 @@ def _format_war_summary_text(war: dict) -> str:
     ]
     for race in sorted(war.get("races", []), key=lambda r: r["race"]):
         pos_text = ",".join(str(p) for p in race.get("positions", []))
-        owner = _normalize_pick_owner(race.get("pick_owner"))
         pick_note = ""
-        if owner == PICK_OWNER_OURS:
-            spot = _parse_pick_spot(race.get("pick_spot"))
-            pick_note = f" [1@{spot}]" if spot is not None else " [1]"
-        elif owner == PICK_OWNER_THEIRS:
-            pick_note = " [2]"
+        if show_pick_notes:
+            owner = _normalize_pick_owner(race.get("pick_owner"))
+            if owner == PICK_OWNER_OURS:
+                spot = _parse_pick_spot(race.get("pick_spot"))
+                pick_note = f" [1@{spot}]" if spot is not None else " [1]"
+            elif owner == PICK_OWNER_THEIRS:
+                pick_note = " [2]"
         lines.append(f"{race['race']}: {race['net']:+d} | {pos_text} ({race['track']}){pick_note}")
     return "\n".join(lines)
 
@@ -3542,6 +3710,7 @@ async def cmd_help(ctx: commands.Context):
         "`!change oppscore <score>` — Change opp score (most recent war)\n"
         "`!change <warID> oppname/teamscore/oppscore <value>` — Target specific war by ID\n"
         "`!deletewar [n]` — Delete nth most recent war (confirm via reaction)\n"
+        "`!dedupewars [preview]` — Preview or remove duplicate logged wars\n"
         "\n"
         "**Sheets**\n"
         "`!update` — Rebuild all derived sheets from War Log\n"
