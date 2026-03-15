@@ -1906,13 +1906,15 @@ async def on_message(message: discord.Message):
         return
 
     ctx = await bot.get_context(message)
-    is_command_message = bool(ctx.valid)
+    # Treat any prefixed message as command-like to avoid accidental auto-log duplicates
+    # when a command is malformed or unrecognized.
+    is_prefixed_message = bool(ctx.prefix)
 
     # In active manual war sessions, support Quaxly-like commandless race input.
     handled_shorthand = await _handle_war_shorthand_message(message)
 
     # Avoid double-logging when users run !addwar with pasted war text.
-    if not handled_shorthand and not is_command_message:
+    if not handled_shorthand and not is_prefixed_message:
         text = _extract_war_text_from_message(message)
         if AUTO_LOG_RESULTS and "Total Score after Race" in text:
             await _log_war(message.channel, text)
@@ -3107,7 +3109,8 @@ async def cmd_dedupewars(ctx: commands.Context, mode: Optional[str] = None):
         rd = spreadsheet.worksheet("Race Details")
         ensure_war_ids(wl)
 
-        preview_mode = str(mode or "").strip().lower() in {"preview", "dry", "dryrun", "dry-run", "check"}
+        mode_token = _clean_command_arg(mode).lower()
+        preview_mode = mode_token in {"preview", "dry", "dryrun", "dry-run", "check", "p"}
 
         wl_records = wl.get_all_records()
         if not wl_records:
