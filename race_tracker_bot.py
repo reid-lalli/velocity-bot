@@ -223,6 +223,7 @@ REACTION_CONFIG: dict[str, Any] = load_reaction_config()
 _REACTION_SCHEDULER_LOCK = asyncio.Lock()
 _LAST_MIDNIGHT_REACT_DATE: Optional[str] = None
 _LAST_CLEANUP_HOUR_KEY: Optional[str] = None
+_STARTUP_REACTION_DONE: bool = False
 _RUNTIME_UNDO_SNAPSHOT: Optional[dict[str, Any]] = None
 _RUNTIME_REDO_SNAPSHOT: Optional[dict[str, Any]] = None
 _LAST_MUTATION_SCOPE: Optional[str] = None
@@ -770,8 +771,14 @@ async def reaction_schedule_loop():
     """Drive daily reaction creation and hourly cleanup using Pacific time."""
     global _LAST_MIDNIGHT_REACT_DATE
     global _LAST_CLEANUP_HOUR_KEY
+    global _STARTUP_REACTION_DONE
 
     if not isinstance(REACTION_CONFIG.get("channel_id"), int):
+        return
+
+    # Skip first tick — on_ready already handled startup reactions.
+    if _STARTUP_REACTION_DONE:
+        _STARTUP_REACTION_DONE = False
         return
 
     now_pt = datetime.now(PT_TZ)
@@ -1890,12 +1897,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 @bot.event
 async def on_ready():
+    global _STARTUP_REACTION_DONE
     print(f"[{datetime.now().strftime('%H:%M:%S')}] Logged in as {bot.user}  |  Tracking wars for {CLAN_NAME}")
     now_pt = datetime.now(PT_TZ)
     if isinstance(REACTION_CONFIG.get("channel_id"), int):
         await _ensure_daily_reaction_slots(now_pt)
     if REACTION_SLOTS:
         await _run_hourly_reaction_cleanup(now_pt)
+    _STARTUP_REACTION_DONE = True
     if not reaction_schedule_loop.is_running():
         reaction_schedule_loop.start()
 
