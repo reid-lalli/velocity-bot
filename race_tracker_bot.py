@@ -2938,7 +2938,7 @@ def _session_as_war_dict(session: dict) -> dict:
 
 
 async def _handle_war_shorthand_message(message: discord.Message) -> bool:
-    """Handle commandless shorthand position input for active war sessions."""
+    """Handle commandless race input (track then shorthand) for active war sessions."""
     session = ACTIVE_WARS.get(message.channel.id)
     if not session:
         return False
@@ -2947,7 +2947,83 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
     if not content or content.startswith("!"):
         return False
 
-    # Shorthand positions: e.g. "13478+" or "137-"
+    # Combined form: "AH 13478+"
+    combo_match = re.fullmatch(r"([A-Za-z0-9_\-]+)\s+([0-9+\-]{2,12})", content)
+    if combo_match:
+        track = combo_match.group(1)
+        canonical_track = _canonical_track_code(track)
+        if canonical_track is None:
+            return False
+        shorthand = combo_match.group(2)
+        positions = _parse_positions_shorthand(shorthand)
+        if not positions:
+            await message.channel.send("Could not parse shorthand. Example: `13478+` or `137-`.")
+            return True
+
+        race_number = _next_unset_race(session)
+        net = _calc_net_from_positions(positions)
+        _mark_runtime_mutation("warset")
+        session["races"][race_number] = {
+            "race": race_number,
+            "net": net,
+            "track": canonical_track,
+            "positions": positions,
+        }
+        try:
+            await message.add_reaction("✅")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        war_preview = _session_as_war_dict(session)
+        await message.channel.send(
+            f"✅ R{race_number} `{canonical_track}` set from shorthand `{shorthand}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
+            f"```\n{_format_war_summary_text(war_preview)}\n```"
+        )
+        return True
+
+    # Shorthand-only form when pending track exists.
+    if "pending_track" in session:
+        positions = _parse_positions_shorthand(content)
+        if not positions:
+            return False
+
+        race_number = _next_unset_race(session)
+        track = session.pop("pending_track")
+        net = _calc_net_from_positions(positions)
+        _mark_runtime_mutation("warset")
+        session["races"][race_number] = {
+            "race": race_number,
+            "net": net,
+            "track": track,
+            "positions": positions,
+        }
+        try:
+            await message.add_reaction("✅")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        war_preview = _session_as_war_dict(session)
+        await message.channel.send(
+            f"✅ R{race_number} `{track}` set from shorthand `{content}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
+            f"```\n{_format_war_summary_text(war_preview)}\n```"
+        )
+        return True
+
+    # Single token track code, e.g. "AH" or "gbr"
+    if re.fullmatch(r"[A-Za-z0-9_\-]{2,8}", content):
+        canonical_track = _canonical_track_code(content)
+        if canonical_track is None:
+            return False
+        session["pending_track"] = canonical_track
+        next_race = _next_unset_race(session)
+        try:
+            await message.add_reaction("🏁")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        await message.channel.send(
+            f"Track set for race {next_race}: `{canonical_track}`. Now send shorthand like `13478+` or `137-`."
+        )
+        return True
+
+    # Shorthand positions only (no track): e.g. "13478+" or "137-"
     positions = _parse_positions_shorthand(content)
     if not positions:
         return False
