@@ -29,6 +29,8 @@ import time
 import json
 import copy
 import math
+import threading
+from collections import deque
 from datetime import datetime
 from typing import Optional, Dict, Any, AsyncIterator, cast
 from zoneinfo import ZoneInfo
@@ -796,10 +798,83 @@ async def before_reaction_schedule_loop():
 
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
-def get_spreadsheet() -> gspread.Spreadsheet:
+
+# Rate limiter to stay under Google Sheets API quota (60 read requests/min/user).
+class _SheetsRateLimiter:
+    """Sliding-window rate limiter for Google Sheets API calls."""
+
+    def __init__(self, max_calls: int = 50, window_secs: float = 60.0):
+        self._max_calls = max_calls
+        self._window = window_secs
+        self._timestamps: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def wait(self):
+        """Block until an API call can be made within the rate limit."""
+        with self._lock:
+            now = time.time()
+            while self._timestamps and self._timestamps[0] <= now - self._window:
+                self._timestamps.popleft()
+            if len(self._timestamps) >= self._max_calls:
+                sleep_time = self._timestamps[0] + self._window - now + 0.1
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                now = time.time()
+                while self._timestamps and self._timestamps[0] <= now - self._window:
+                    self._timestamps.popleft()
+            self._timestamps.append(time.time())
+
+
+_sheets_limiter = _SheetsRateLimiter()
+
+_THROTTLED_WS_METHODS = frozenset({
+    'row_values', 'col_values', 'get_all_values', 'get_all_records',
+    'append_row', 'append_rows', 'update', 'update_acell', 'update_cell',
+    'batch_clear', 'batch_update', 'format', 'batch_format',
+    'add_rows', 'add_cols', 'resize',
+    'delete_rows', 'delete_columns',
+})
+
+
+class _ThrottledWorksheet:
+    """Proxy that rate-limits gspread Worksheet API calls."""
+
+    def __init__(self, ws):
+        object.__setattr__(self, '_ws', ws)
+
+    def __getattr__(self, name) -> Any:
+        attr = getattr(self._ws, name)
+        if callable(attr) and name in _THROTTLED_WS_METHODS:
+            def wrapper(*args, **kwargs):
+                _sheets_limiter.wait()
+                return attr(*args, **kwargs)
+            return wrapper
+        return attr
+
+    def __setattr__(self, name, value):
+        setattr(self._ws, name, value)
+
+
+class _ThrottledSpreadsheet:
+    """Proxy that rate-limits gspread Spreadsheet worksheet lookups."""
+
+    def __init__(self, ss):
+        object.__setattr__(self, '_ss', ss)
+
+    def __getattr__(self, name) -> Any:
+        attr = getattr(self._ss, name)
+        if name in ('worksheet', 'add_worksheet'):
+            def wrapper(*args, **kwargs):
+                _sheets_limiter.wait()
+                return _ThrottledWorksheet(attr(*args, **kwargs))
+            return wrapper
+        return attr
+
+
+def get_spreadsheet():
     creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=SHEETS_SCOPES)
     gc = gspread.authorize(creds)
-    return gc.open_by_key(SPREADSHEET_ID)
+    return _ThrottledSpreadsheet(gc.open_by_key(SPREADSHEET_ID))
 
 
 def _is_retryable_sheets_error(exc: Exception) -> bool:
