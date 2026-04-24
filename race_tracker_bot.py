@@ -1930,7 +1930,7 @@ async def cmd_warcancel(ctx: commands.Context):
         await ctx.send("No active war session to cancel.")
 
 
-@bot.command(name="undorace")
+@bot.command(name="undorace", aliases=["raceundo"])
 async def cmd_undorace(ctx: commands.Context):
     """
     Undo the last race entered in the active war session.
@@ -1956,17 +1956,18 @@ async def cmd_undorace(ctx: commands.Context):
 
     last_race_num = max(session["races"].keys())
     removed = session["races"].pop(last_race_num)
+    removed_track = removed.get("track", "N/A")
 
     if not session["races"]:
         await ctx.send(
-            f"↩️ Removed race `{last_race_num}` (`{removed['track']}`, net `{removed['net']:+d}`). "
+            f"↩️ Removed race `{last_race_num}` (`{removed_track}`, net `{removed['net']:+d}`). "
             "No races remaining."
         )
         return
 
     war_preview = _session_as_war_dict(session)
     await ctx.send(
-        f"↩️ Removed race `{last_race_num}` (`{removed['track']}`, net `{removed['net']:+d}`)."
+        f"↩️ Removed race `{last_race_num}` (`{removed_track}`, net `{removed['net']:+d}`)."
         f"{'  Also cleared pending track.' if had_pending else ''}\n"
         f"```\n{_format_war_summary_text(war_preview)}\n```"
     )
@@ -2129,6 +2130,7 @@ async def cmd_trackstats(ctx: commands.Context, arg: Optional[str] = None):
     • !trackstats         — all tracks sorted by average gain per race
     • !trackstats rAF     — stats for a specific track
     • !trackstats 3       — only tracks played at least 3 times
+    • !trackstats SR      — stats filtered to races vs a specific opponent/team
     """
     try:
         spreadsheet = get_spreadsheet()
@@ -2136,10 +2138,6 @@ async def cmd_trackstats(ctx: commands.Context, arg: Optional[str] = None):
         records = ts.get_all_records()
         arg_clean = _clean_command_arg(arg)
         min_played_arg = _parse_nonnegative_int_arg(arg_clean)
-
-        if not records:
-            await ctx.send("No track data logged yet.")
-            return
 
         if arg_clean and min_played_arg is None:
             track = arg_clean
@@ -2153,7 +2151,80 @@ async def cmd_trackstats(ctx: commands.Context, arg: Optional[str] = None):
                 None,
             )
             if not match:
-                await ctx.send(f"Track `{track}` not found in the stats sheet.")
+                # Fallback: interpret non-track token as opponent/team filter.
+                # Build stats from Race Details so filters are independent of global aggregate sheet.
+                team = arg_clean.upper()
+                rd = spreadsheet.worksheet("Race Details")
+                rd_records = rd.get_all_records()
+                team_rows = [
+                    row
+                    for row in rd_records
+                    if _clean_command_arg(str(row.get("Opponent", ""))).upper() == team
+                ]
+
+                if not team_rows:
+                    await ctx.send(f"No track stats found for track/team `{track}`.")
+                    return
+
+                aggregate: dict[str, dict[str, Any]] = {}
+                for row in team_rows:
+                    raw_track = str(row.get("Track", "")).strip()
+                    track_name = _canonical_track_code(raw_track) or raw_track
+                    if not track_name:
+                        continue
+
+                    net = _to_int(row.get("Net Score"))
+                    if net is None:
+                        continue
+
+                    entry = aggregate.setdefault(
+                        track_name,
+                        {
+                            "times": 0,
+                            "net_total": 0,
+                            "best": net,
+                            "worst": net,
+                        },
+                    )
+                    entry["times"] += 1
+                    entry["net_total"] += net
+                    entry["best"] = max(entry["best"], net)
+                    entry["worst"] = min(entry["worst"], net)
+
+                if not aggregate:
+                    await ctx.send(f"No race detail data with valid track/net values found vs `{team}`.")
+                    return
+
+                rows = []
+                for track_name, data in aggregate.items():
+                    times = int(data["times"])
+                    net_total = int(data["net_total"])
+                    avg = (net_total / times) if times > 0 else 0.0
+                    rows.append(
+                        {
+                            "track": track_name,
+                            "times": times,
+                            "net": net_total,
+                            "avg": avg,
+                        }
+                    )
+
+                rows.sort(key=lambda r: r["avg"], reverse=True)
+                lines = [
+                    "```",
+                    f"Track Stats vs {team}",
+                    f"{'Track':<8}  {'Played':>6}  {'Net':>6}  {'Avg':>6}",
+                    "─" * 32,
+                ]
+                for row in rows:
+                    lines.append(
+                        f"{row['track']:<8}  "
+                        f"{row['times']:>6}  "
+                        f"{row['net']:>+6}  "
+                        f"{row['avg']:>6.2f}"
+                    )
+                lines.append("```")
+                await ctx.send("\n".join(lines))
                 return
 
             color = 0x57F287 if int(match.get("Net Total", 0)) >= 0 else 0xED4245
@@ -2165,6 +2236,10 @@ async def cmd_trackstats(ctx: commands.Context, arg: Optional[str] = None):
             embed.add_field(name="Worst Score",  value=match.get("Worst Score", "N/A"), inline=True)
             await ctx.send(embed=embed)
         else:
+            if not records:
+                await ctx.send("No track data logged yet.")
+                return
+
             min_played = min_played_arg or 0
             if min_played > 0:
                 records = [r for r in records if int(r.get("Times Played", 0)) >= min_played]
@@ -2293,10 +2368,19 @@ async def cmd_undo(ctx: commands.Context):
         _restore_runtime_state(_RUNTIME_UNDO_SNAPSHOT)
         _LAST_UNDONE_SCOPE = "runtime"
         _LAST_UNDONE_ACTION = _LAST_MUTATION_ACTION
-        await ctx.send(
-            f"↩️ Undoing `!{_LAST_MUTATION_ACTION}`. "
-            "Use `!redo` if this was a mistake."
-        )
+        session = ACTIVE_WARS.get(ctx.channel.id)
+        if session:
+            war_preview = _session_as_war_dict(session)
+            await ctx.send(
+                f"↩️ Undoing `!{_LAST_MUTATION_ACTION}`."
+                " Use `!redo` if this was a mistake.\n"
+                f"```\n{_format_war_summary_text(war_preview)}\n```"
+            )
+        else:
+            await ctx.send(
+                f"↩️ Undoing `!{_LAST_MUTATION_ACTION}`. "
+                "Use `!redo` if this was a mistake."
+            )
         return
 
     if _LAST_MUTATION_SCOPE != "sheets":
@@ -3083,7 +3167,7 @@ async def cmd_help(ctx: commands.Context):
         "`!warstart <opponent>` — Start a manual war session\n"
         "`!warset <race> <net> <positions>` — Set/update one race result (positions as 1,3,4,7,10,12)\n"
         "`!editspots <race> <positions>` — Edit finishing positions for a race (recalculates net)\n"
-        "`!undorace` — Remove the last race from the active session\n"
+        "`!undorace` / `!raceundo` — Remove the last race from the active session\n"
         "`!warshow` — Preview current session in Quaxly format\n"
         "`!warcancel` — Cancel/discard the active session\n"
         "`!warend [vy_score] [opp_score]` — Finalize and export to Sheets\n"
@@ -3093,6 +3177,7 @@ async def cmd_help(ctx: commands.Context):
         "`!trackstats` — All tracks sorted by avg net\n"
         "`!trackstats <code>` — One specific track, e.g. `!trackstats rAF`\n"
         "`!trackstats <n>` — Tracks played at least n times\n"
+        "`!trackstats <team>` — Track stats only vs that opponent/team, e.g. `!trackstats SR`\n"
         "`!warids [n]` — Recent war IDs\n"
         "\n"
         "**Editing Logged Wars**\n"
