@@ -62,6 +62,9 @@ REDO_PREFIX = "_REDO_"
 # Active in-memory war sessions keyed by channel ID.
 ACTIVE_WARS: Dict[int, Dict[str, Any]] = {}
 
+# Team 2 active in-memory war sessions keyed by channel ID.
+ACTIVE_WARS_T2: Dict[int, Dict[str, Any]] = {}
+
 # 6v6 points table used by Quaxly-style net calculations.
 PLACE_POINTS = {
     1: 15, 2: 12, 3: 10, 4: 9, 5: 8, 6: 7,
@@ -234,6 +237,7 @@ def _capture_runtime_state() -> dict[str, Any]:
     """Capture bot runtime state for one-step undo/redo of non-sheets commands."""
     return {
         "active_wars": copy.deepcopy(ACTIVE_WARS),
+        "active_wars_t2": copy.deepcopy(ACTIVE_WARS_T2),
         "reaction_slots": copy.deepcopy(REACTION_SLOTS),
         "reaction_config": copy.deepcopy(REACTION_CONFIG),
     }
@@ -242,10 +246,12 @@ def _capture_runtime_state() -> dict[str, Any]:
 def _restore_runtime_state(snapshot: dict[str, Any]):
     """Restore bot runtime state and persist reaction config/slots."""
     global ACTIVE_WARS
+    global ACTIVE_WARS_T2
     global REACTION_SLOTS
     global REACTION_CONFIG
 
     ACTIVE_WARS = copy.deepcopy(snapshot.get("active_wars", {}))
+    ACTIVE_WARS_T2 = copy.deepcopy(snapshot.get("active_wars_t2", {}))
     REACTION_SLOTS = copy.deepcopy(snapshot.get("reaction_slots", []))
     REACTION_CONFIG = copy.deepcopy(snapshot.get("reaction_config", load_reaction_config()))
     save_reaction_slots(REACTION_SLOTS)
@@ -1327,6 +1333,186 @@ def refresh_summary_sheets(spreadsheet):
         net_tracker.append_rows(net_rows)
 
 
+def setup_headers_t2(spreadsheet) -> tuple:
+    """Ensure all Team 2 sheets exist with correct headers."""
+    clan = CLAN_NAME + " T2"
+
+    # War Log T2
+    wl = _get_or_create_ws(spreadsheet, "War Log T2")
+    if not wl.row_values(1):
+        headers = ["War ID", "Date", "Opponent", f"{CLAN_NAME} Score", "Opp Score", "Net"]
+        headers += [f"R{i} Net" for i in range(1, 13)]
+        headers += [f"R{i} Track" for i in range(1, 13)]
+        wl.append_row(headers)
+        wl.format(f"A1:{_column_letter(len(headers))}1", {"textFormat": {"bold": True}})
+    else:
+        _normalize_war_log_layout_t2(wl)
+
+    # Track Stats T2
+    ts = _get_or_create_ws(spreadsheet, "Track Stats T2", rows=300, cols=6)
+    if not ts.row_values(1):
+        ts.append_row(["Track", "Times Played", "Net Total", "Avg per Race", "Best Score", "Worst Score"])
+        ts.format("A1:F1", {"textFormat": {"bold": True}})
+
+    # Race Details T2
+    rd = _get_or_create_ws(spreadsheet, "Race Details T2")
+    if not rd.row_values(1):
+        rd.append_row(["Date", "Opponent", "Race #", "Net Score", "Vy Positions", "Track", "War ID"])
+        rd.format("A1:G1", {"textFormat": {"bold": True}})
+    else:
+        _ensure_header_column(rd, "War ID")
+
+    # War Track Summary T2
+    wts = _get_or_create_ws(spreadsheet, "War Track Summary T2", rows=1000, cols=5)
+    if not wts.row_values(1):
+        wts.append_row(["War Date", "Opponent", "Track", "Net Score", "Rank", "War ID"])
+        wts.format("A1:F1", {"textFormat": {"bold": True}})
+    else:
+        _ensure_header_column(wts, "War ID")
+
+    # Net Tracker T2
+    nt = _get_or_create_ws(spreadsheet, "Net Tracker T2", rows=1000, cols=4)
+    if not nt.row_values(1):
+        nt.append_row(["Date", "Opponent", "Net", "War ID"])
+        nt.format("A1:D1", {"textFormat": {"bold": True}})
+    else:
+        _ensure_header_column(nt, "War ID")
+
+    return wl, ts, rd, wts, nt
+
+
+def _normalize_war_log_layout_t2(war_log):
+    """Ensure War Log T2 columns follow the canonical layout."""
+    desired_headers = ["War ID", "Date", "Opponent", f"{CLAN_NAME} Score", "Opp Score", "Net"]
+    desired_headers += [f"R{i} Net" for i in range(1, 13)]
+    desired_headers += [f"R{i} Track" for i in range(1, 13)]
+
+    current_headers = war_log.row_values(1)
+    if current_headers == desired_headers:
+        return
+
+    records = war_log.get_all_records()
+    _clear_data_rows(war_log)
+    war_log.update(range_name=f"A1:{_column_letter(len(desired_headers))}1", values=[desired_headers])
+    war_log.format(f"A1:{_column_letter(len(desired_headers))}1", {"textFormat": {"bold": True}})
+    if records:
+        war_log.append_rows([[record.get(h, "") for h in desired_headers] for record in records])
+
+
+def refresh_summary_sheets_t2(spreadsheet):
+    """Rebuild Team 2 derived sheets from War Log T2."""
+    war_log, track_stats, race_details, war_track_summary, net_tracker = setup_headers_t2(spreadsheet)
+    ensure_war_ids_t2(war_log)
+
+    war_records = war_log.get_all_records()
+
+    _clear_data_rows(track_stats)
+    _clear_data_rows(war_track_summary)
+    _clear_data_rows(net_tracker)
+
+    track_totals: dict[str, dict] = {}
+    summary_rows = []
+    net_rows = []
+
+    for record in war_records:
+        war = _war_from_log_row(record)
+        net_rows.append([
+            war["date"],
+            war["opponent"],
+            war["difference"] if war["difference"] is not None else "",
+            war["war_id"] if war["war_id"] is not None else "",
+        ])
+
+        ranked_races = sorted(war["races"], key=lambda race: race["net"], reverse=True)
+        for rank, race in enumerate(ranked_races, start=1):
+            summary_rows.append([
+                war["date"],
+                war["opponent"],
+                race["track"],
+                race["net"],
+                rank,
+                war["war_id"] if war["war_id"] is not None else "",
+            ])
+            track_entry = track_totals.setdefault(race["track"], {"played": 0, "net": 0, "scores": []})
+            track_entry["played"] += 1
+            track_entry["net"] += race["net"]
+            track_entry["scores"].append(race["net"])
+
+    track_rows = []
+    for track, data in track_totals.items():
+        avg = round(data["net"] / data["played"], 2) if data["played"] else 0
+        track_rows.append([track, data["played"], data["net"], avg, max(data["scores"]), min(data["scores"])])
+    track_rows.sort(key=lambda row: (row[3], row[2], row[0]), reverse=True)
+
+    if track_rows:
+        track_stats.append_rows(track_rows)
+    if summary_rows:
+        war_track_summary.append_rows(summary_rows)
+    if net_rows:
+        net_tracker.append_rows(net_rows)
+
+
+def ensure_war_ids_t2(war_log):
+    """Guarantee every War Log T2 row has a numeric War ID."""
+    war_id_column = _ensure_header_column(war_log, "War ID")
+    war_records = war_log.get_all_records()
+    max_existing_id = 0
+    for record in war_records:
+        war_id = _to_int(record.get("War ID"))
+        if war_id is not None:
+            max_existing_id = max(max_existing_id, war_id)
+    next_id = max_existing_id + 1
+    column_letter = _column_letter(war_id_column)
+    for row_number, record in enumerate(war_records, start=2):
+        if _to_int(record.get("War ID")) is None:
+            war_log.update_acell(f"{column_letter}{row_number}", str(next_id))
+            next_id += 1
+
+
+def write_war_t2(war: dict):
+    """Write a parsed war dict to all five Team 2 Google Sheets."""
+    spreadsheet = get_spreadsheet()
+    war_log, _track_stats, race_details, _war_track_summary, _net_tracker = setup_headers_t2(spreadsheet)
+    ensure_war_ids_t2(war_log)
+    existing_wars = war_log.get_all_records()
+    next_war_id = max((_to_int(record.get("War ID")) or 0 for record in existing_wars), default=0) + 1
+    war["war_id"] = next_war_id
+
+    race_nets   = {r["race"]: r["net"]   for r in war["races"]}
+    race_tracks = {r["race"]: r["track"] for r in war["races"]}
+
+    wl_row = [
+        war["war_id"],
+        war["date"],
+        war["opponent"],
+        war["vy_score"]   if war["vy_score"]   is not None else "",
+        war["opp_score"]  if war["opp_score"]  is not None else "",
+        war["difference"] if war["difference"] is not None else "",
+    ]
+    for i in range(1, 13):
+        wl_row.append(race_nets.get(i, ""))
+    for i in range(1, 13):
+        wl_row.append(race_tracks.get(i, ""))
+    war_log.append_row(wl_row)
+
+    detail_rows = [
+        [
+            war["date"],
+            war["opponent"],
+            r["race"],
+            r["net"],
+            ", ".join(str(p) for p in r["positions"]),
+            r.get("track", ""),
+            war["war_id"],
+        ]
+        for r in war["races"]
+    ]
+    if detail_rows:
+        race_details.append_rows(detail_rows)
+
+    refresh_summary_sheets_t2(spreadsheet)
+
+
 def setup_headers(spreadsheet) -> tuple:
     """Ensure all primary/analytics sheets exist with correct headers."""
     # War Log ─────────────────────────────────────────────────────────────────
@@ -1856,6 +2042,75 @@ async def cmd_warstart(ctx: commands.Context, opponent: str):
     )
 
 
+@bot.command(name="warstart2")
+async def cmd_warstart2(ctx: commands.Context, opponent: str):
+    """
+    Start a Team 2 manual war session in this channel.
+    Usage: !warstart2 <opponent>
+    """
+    channel_id = ctx.channel.id
+    _mark_runtime_mutation("warstart2")
+    ACTIVE_WARS_T2[channel_id] = {
+        "opponent": opponent.strip().upper(),
+        "races": {},
+        "created_by": ctx.author.id,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    await ctx.send(
+        f"✅ [Team 2] Started war vs `{opponent.strip().upper()}`.\n"
+        "No race limit is enforced; keep entering races until `!warend2`.\n"
+        "Add race results with: `!warset2 <race> <net> <positions_csv>`\n"
+        "Example: `!warset2 1 +24 1,2,4,6,7,9`\n"
+        "Or use shorthand prefixed with `2 `, e.g. `2 AH 13478+`"
+    )
+
+
+@bot.command(name="warset2")
+async def cmd_warset2(ctx: commands.Context, race: int, net: int, positions_csv: str):
+    """
+    Set/update one race result in Team 2 active session.
+    Usage: !warset2 <race> <net> <positions_csv>
+    """
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS_T2.get(channel_id)
+    if not session:
+        await ctx.send("No active Team 2 war in this channel. Start one with `!warstart2 <opponent>`.")
+        return
+
+    if race < 1:
+        await ctx.send("Race number must be 1 or greater.")
+        return
+
+    positions = []
+    for token in positions_csv.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if not token.isdigit():
+            await ctx.send("Positions must be comma-separated integers, e.g. `1,2,4,6,7,9`.")
+            return
+        positions.append(int(token))
+
+    if not positions:
+        await ctx.send("Please provide at least one finishing position.")
+        return
+
+    computed_net = _calc_net_from_positions(positions)
+    net_note = f" (auto-net adjusted from {int(net):+d} to {computed_net:+d})" if int(net) != computed_net else ""
+
+    _mark_runtime_mutation("warset2")
+    session["races"][race] = {
+        "race": race,
+        "net": computed_net,
+        "positions": positions,
+    }
+    war_preview = _session_as_war_dict(session)
+    await ctx.send(
+        f"✅ [T2] Set race `{race}` with `{positions_csv}` -> net `{computed_net:+d}`{net_note}\n"
+        f"```\n{_format_war_summary_text(war_preview)}\n```"
+    )
+
+
 @bot.command(name="warset")
 async def cmd_warset(ctx: commands.Context, race: int, net: int, positions_csv: str):
     """
@@ -1918,6 +2173,19 @@ async def cmd_warshow(ctx: commands.Context):
     await ctx.send(f"```\n{_format_war_summary_text(summary)}\n```")
 
 
+@bot.command(name="warshow2")
+async def cmd_warshow2(ctx: commands.Context):
+    """Show current active Team 2 war session in Quaxly-like format."""
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS_T2.get(channel_id)
+    if not session:
+        await ctx.send("No active Team 2 war in this channel.")
+        return
+
+    summary = _session_as_war_dict(session)
+    await ctx.send(f"[Team 2]\n```\n{_format_war_summary_text(summary)}\n```")
+
+
 @bot.command(name="warcancel")
 async def cmd_warcancel(ctx: commands.Context):
     """Cancel the active war session in this channel."""
@@ -1928,6 +2196,18 @@ async def cmd_warcancel(ctx: commands.Context):
         await ctx.send("🛑 Active war session cancelled.")
     else:
         await ctx.send("No active war session to cancel.")
+
+
+@bot.command(name="warcancel2")
+async def cmd_warcancel2(ctx: commands.Context):
+    """Cancel the active Team 2 war session in this channel."""
+    channel_id = ctx.channel.id
+    if channel_id in ACTIVE_WARS_T2:
+        _mark_runtime_mutation("warcancel2")
+        del ACTIVE_WARS_T2[channel_id]
+        await ctx.send("🛑 Active Team 2 war session cancelled.")
+    else:
+        await ctx.send("No active Team 2 war session to cancel.")
 
 
 @bot.command(name="undorace", aliases=["raceundo"])
@@ -1969,6 +2249,103 @@ async def cmd_undorace(ctx: commands.Context):
     await ctx.send(
         f"↩️ Removed race `{last_race_num}` (`{removed_track}`, net `{removed['net']:+d}`)."
         f"{'  Also cleared pending track.' if had_pending else ''}\n"
+        f"```\n{_format_war_summary_text(war_preview)}\n```"
+    )
+
+
+@bot.command(name="undorace2", aliases=["raceundo2"])
+async def cmd_undorace2(ctx: commands.Context):
+    """
+    Undo the last race entered in the Team 2 active war session.
+    Usage: !undorace2
+    """
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS_T2.get(channel_id)
+    if not session:
+        await ctx.send("No active Team 2 war in this channel.")
+        return
+
+    _mark_runtime_mutation("undorace2")
+    had_pending = "pending_track" in session
+    session.pop("pending_track", None)
+
+    if not session["races"]:
+        msg = "No races to undo."
+        if had_pending:
+            msg = "Cleared pending track (no races to undo)."
+        await ctx.send(msg)
+        return
+
+    last_race_num = max(session["races"].keys())
+    removed = session["races"].pop(last_race_num)
+    removed_track = removed.get("track", "N/A")
+
+    if not session["races"]:
+        await ctx.send(
+            f"↩️ [T2] Removed race `{last_race_num}` (`{removed_track}`, net `{removed['net']:+d}`). "
+            "No races remaining."
+        )
+        return
+
+    war_preview = _session_as_war_dict(session)
+    await ctx.send(
+        f"↩️ [T2] Removed race `{last_race_num}` (`{removed_track}`, net `{removed['net']:+d}`)."
+        f"{'  Also cleared pending track.' if had_pending else ''}\n"
+        f"```\n{_format_war_summary_text(war_preview)}\n```"
+    )
+
+
+@bot.command(name="editspots2")
+async def cmd_editspots2(ctx: commands.Context, race: int, *, spots: str):
+    """
+    Edit the finishing positions for an existing race in the Team 2 active session.
+    Usage:
+      !editspots2 3 1,2,4,6,7,9
+      !editspots2 3 13468+
+    """
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS_T2.get(channel_id)
+    if not session:
+        await ctx.send("No active Team 2 war in this channel.")
+        return
+
+    if race not in session["races"]:
+        await ctx.send(f"Race `{race}` not found. Use `!warshow2` to see current races.")
+        return
+
+    spots = spots.strip()
+    positions: Optional[list[int]] = None
+    if "," in spots or re.fullmatch(r"[\d\s]+", spots):
+        parsed = []
+        valid = True
+        for token in re.split(r"[,\s]+", spots):
+            if not token:
+                continue
+            if not token.isdigit():
+                valid = False
+                break
+            parsed.append(int(token))
+        if valid and parsed:
+            positions = parsed
+
+    if positions is None:
+        positions = _parse_positions_shorthand(spots)
+        if positions is None:
+            await ctx.send("Could not parse positions. Use CSV like `1,2,4,6,7,9` or shorthand like `13478+`.")
+            return
+
+    net = _calc_net_from_positions(positions)
+    old_net = session["races"][race]["net"]
+    track = session["races"][race].get("track", "")
+
+    _mark_runtime_mutation("editspots2")
+    session["races"][race]["positions"] = positions
+    session["races"][race]["net"] = net
+
+    war_preview = _session_as_war_dict(session)
+    await ctx.send(
+        f"✅ [T2] Race `{race}` (`{track}`) positions updated to `{','.join(map(str, positions))}` "
+        f"-> net `{net:+d}` (was `{old_net:+d}`)\n"
         f"```\n{_format_war_summary_text(war_preview)}\n```"
     )
 
@@ -2089,6 +2466,57 @@ async def cmd_warend(ctx: commands.Context, vy_score: Optional[int] = None, opp_
         )
     except Exception as exc:
         await ctx.send(f"❌ Failed to export war: `{exc}`")
+
+
+@bot.command(name="warend2")
+async def cmd_warend2(ctx: commands.Context, vy_score: Optional[int] = None, opp_score: Optional[int] = None):
+    """
+    Finalize Team 2 active war and export it to Google Sheets (Team 2 tabs).
+    Usage:
+        !warend2
+        !warend2 <vy_score> <opp_score>
+    """
+    channel_id = ctx.channel.id
+    session = ACTIVE_WARS_T2.get(channel_id)
+    if not session:
+        await ctx.send("No active Team 2 war in this channel. Start one with `!warstart2`.")
+        return
+
+    if len(session["races"]) == 0:
+        await ctx.send("No race entries were set. Add races with `!warset2` first.")
+        return
+
+    war = _session_as_war_dict(session)
+    war["num_races"] = len(session["races"])
+
+    if vy_score is not None and opp_score is not None:
+        war["vy_score"] = int(vy_score)
+        war["opp_score"] = int(opp_score)
+        war["difference"] = int(vy_score) - int(opp_score)
+
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: (
+                run_sheets_with_retry(backup_state, get_spreadsheet(), "warend2"),
+                run_sheets_with_retry(write_war_t2, war),
+            ),
+        )
+        _mark_runtime_mutation("warend2")
+        _mark_sheets_mutation("warend2")
+        del ACTIVE_WARS_T2[channel_id]
+        diff = int(war.get("difference", 0) or 0)
+        outcome = "WIN" if diff > 0 else ("LOSS" if diff < 0 else "TIE")
+
+        await ctx.send(
+            f"✅ [Team 2] Exported war vs `{war['opponent']}` to Google Sheets (T2 tabs).\n"
+            f"**Result:** {outcome}\n"
+            f"**Total Differential:** {diff:+d}\n"
+            f"```\n{_format_war_summary_text(war)}\n```"
+        )
+    except Exception as exc:
+        await ctx.send(f"❌ Failed to export Team 2 war: `{exc}`")
 
 
 def _clean_command_arg(arg: Optional[str]) -> str:
@@ -3022,7 +3450,19 @@ def _session_as_war_dict(session: dict) -> dict:
 
 
 async def _handle_war_shorthand_message(message: discord.Message) -> bool:
-    """Handle commandless race input (track then shorthand) for active war sessions."""
+    """Handle commandless race input (track then shorthand) for active war sessions (T1 and T2)."""
+    # Team 2 shorthand: prefix message with "2 " e.g. "2 AH 13478+" or "2 13478+"
+    content_raw = (message.content or "").strip()
+    t2_prefix_match = re.match(r"^2\s+(.+)$", content_raw)
+    if t2_prefix_match:
+        session_t2 = ACTIVE_WARS_T2.get(message.channel.id)
+        if session_t2:
+            result = await _process_shorthand_for_session(
+                message, session_t2, t2_prefix_match.group(1).strip(), team_label="T2"
+            )
+            if result:
+                return True
+
     session = ACTIVE_WARS.get(message.channel.id)
     if not session:
         return False
@@ -3030,6 +3470,16 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
     content = (message.content or "").strip()
     if not content or content.startswith("!"):
         return False
+
+    return await _process_shorthand_for_session(message, session, content, team_label="")
+
+
+async def _process_shorthand_for_session(
+    message: discord.Message, session: dict, content: str, team_label: str = ""
+) -> bool:
+    """Core shorthand parsing logic, shared by T1 and T2 sessions."""
+    prefix = f"[{team_label}] " if team_label else ""
+    mutation_action = "warset2" if team_label == "T2" else "warset"
 
     # Combined form: "AH 13478+"
     combo_match = re.fullmatch(r"([A-Za-z0-9_\-]+)\s+([0-9+\-]{2,12})", content)
@@ -3046,7 +3496,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
 
         race_number = _next_unset_race(session)
         net = _calc_net_from_positions(positions)
-        _mark_runtime_mutation("warset")
+        _mark_runtime_mutation(mutation_action)
         session["races"][race_number] = {
             "race": race_number,
             "net": net,
@@ -3059,7 +3509,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
             pass
         war_preview = _session_as_war_dict(session)
         await message.channel.send(
-            f"✅ R{race_number} `{canonical_track}` set from shorthand `{shorthand}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
+            f"✅ {prefix}R{race_number} `{canonical_track}` set from shorthand `{shorthand}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
             f"```\n{_format_war_summary_text(war_preview)}\n```"
         )
         return True
@@ -3073,7 +3523,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
         race_number = _next_unset_race(session)
         track = session.pop("pending_track")
         net = _calc_net_from_positions(positions)
-        _mark_runtime_mutation("warset")
+        _mark_runtime_mutation(mutation_action)
         session["races"][race_number] = {
             "race": race_number,
             "net": net,
@@ -3086,7 +3536,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
             pass
         war_preview = _session_as_war_dict(session)
         await message.channel.send(
-            f"✅ R{race_number} `{track}` set from shorthand `{content}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
+            f"✅ {prefix}R{race_number} `{track}` set from shorthand `{content}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
             f"```\n{_format_war_summary_text(war_preview)}\n```"
         )
         return True
@@ -3103,7 +3553,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
         except (discord.Forbidden, discord.HTTPException):
             pass
         await message.channel.send(
-            f"Track set for race {next_race}: `{canonical_track}`. Now send shorthand like `13478+` or `137-`."
+            f"{prefix}Track set for race {next_race}: `{canonical_track}`. Now send shorthand like `13478+` or `137-`."
         )
         return True
 
@@ -3114,7 +3564,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
 
     race_number = _next_unset_race(session)
     net = _calc_net_from_positions(positions)
-    _mark_runtime_mutation("warset")
+    _mark_runtime_mutation(mutation_action)
     session["races"][race_number] = {
         "race": race_number,
         "net": net,
@@ -3126,7 +3576,7 @@ async def _handle_war_shorthand_message(message: discord.Message) -> bool:
         pass
     war_preview = _session_as_war_dict(session)
     await message.channel.send(
-        f"✅ R{race_number} set from shorthand `{content}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
+        f"✅ {prefix}R{race_number} set from shorthand `{content}` -> positions `{','.join(map(str, positions))}`, net `{net:+d}`\n"
         f"```\n{_format_war_summary_text(war_preview)}\n```"
     )
     return True
@@ -3163,7 +3613,7 @@ async def cmd_help(ctx: commands.Context):
         "**War Logging**\n"
         "`!addwar <paste>` — Manually log a war (paste Quaxly output, or reply to Quaxly message and run `!addwar`)\n"
         "\n"
-        "**Live War Session**\n"
+        "**Live War Session (Main)**\n"
         "`!warstart <opponent>` — Start a manual war session\n"
         "`!warset <race> <net> <positions>` — Set/update one race result (positions as 1,3,4,7,10,12)\n"
         "`!editspots <race> <positions>` — Edit finishing positions for a race (recalculates net)\n"
@@ -3171,6 +3621,16 @@ async def cmd_help(ctx: commands.Context):
         "`!warshow` — Preview current session in Quaxly format\n"
         "`!warcancel` — Cancel/discard the active session\n"
         "`!warend [vy_score] [opp_score]` — Finalize and export to Sheets\n"
+        "\n"
+        "**Live War Session (Team 2)**\n"
+        "`!warstart2 <opponent>` — Start a Team 2 war session\n"
+        "`!warset2 <race> <net> <positions>` — Set/update one race (Team 2)\n"
+        "`!editspots2 <race> <positions>` — Edit positions for a Team 2 race\n"
+        "`!undorace2` / `!raceundo2` — Remove last Team 2 race\n"
+        "`!warshow2` — Preview Team 2 session\n"
+        "`!warcancel2` — Cancel Team 2 session\n"
+        "`!warend2 [vy_score] [opp_score]` — Finalize and export Team 2 war to Sheets\n"
+        "*Shorthand in chat: prefix with `2 ` to route to Team 2, e.g. `2 AH 13478+`*\n"
         "\n"
         "**Stats**\n"
         "`!warstats [n]` — Last n wars (default 5)\n"
