@@ -2,8 +2,8 @@
 """
 Vy Clan War Result Tracker — Discord Bot
 =========================================
-Automatically detects Lorenzi/Quaxly-format war results in Discord,
-parses them, and logs everything to Google Sheets.
+Parses Lorenzi/Quaxly-format war results submitted through bot commands
+and logs them to Google Sheets.
 
 Sheets created:
   • War Log      — one row per war (totals + per-race nets)
@@ -47,7 +47,6 @@ DISCORD_TOKEN    = os.getenv("DISCORD_TOKEN", "")
 SPREADSHEET_ID   = os.getenv("SPREADSHEET_ID", "")
 CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
 CLAN_NAME        = os.getenv("CLAN_NAME", "Vy")
-AUTO_LOG_RESULTS = os.getenv("AUTO_LOG_RESULTS", "true").strip().lower() in ("1", "true", "yes", "on")
 
 SHEETS_SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -93,7 +92,8 @@ VALID_TRACKS = {
     "rDDJ", "SSS", "rAF", "rSHS", "rDH", "rKTB", "MBC", "BC",
     "rSGB", "GBR", "rWS", "rPB", "rWSh", "SP", "rTF", "CC",
     "CCF", "WS", "AH", "rMMM", "DD", "rCM", "RR", "PS", "rMC",
-    "FO", "DKS", "BCi", "rDKP", "DBB",
+    "FO", "DKS", "BCi", "rDKP", "DBB", "rMC1", "rMC2", "rMC3",
+    "rGV1", "rGV2", "rGV3", "rCI1", "rCI2", "rVL1", "rKB1",
 }
 VALID_TRACK_MAP = {track.lower(): track for track in VALID_TRACKS}
 
@@ -1631,18 +1631,11 @@ async def on_message(message: discord.Message):
         return
 
     ctx = await bot.get_context(message)
-    # Treat any prefixed message as command-like to avoid accidental auto-log duplicates
-    # when a command is malformed or unrecognized.
     is_prefixed_message = bool(ctx.prefix)
 
     # In active manual war sessions, support Quaxly-like commandless race input.
-    handled_shorthand = await _handle_war_shorthand_message(message)
-
-    # Avoid double-logging when users run !addwar with pasted war text.
-    if not handled_shorthand and not is_prefixed_message:
-        text = _extract_war_text_from_message(message)
-        if AUTO_LOG_RESULTS and "Total Score after Race" in text:
-            await _log_war(message.channel, text)
+    if not is_prefixed_message:
+        await _handle_war_shorthand_message(message)
 
     await bot.process_commands(message)
 
