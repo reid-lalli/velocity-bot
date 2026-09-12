@@ -102,6 +102,10 @@ REACTION_CONFIG_FILE = "reaction_schedule_config.json"
 DEFAULT_REACT_START_HOUR = 9
 DEFAULT_REACT_END_HOUR = 22
 
+# Matches team tags like "777 (Jackpot)" or "21 (Blackjack)" so the leading
+# number can be treated as the team identifier everywhere.
+TEAM_NUMBER_TAG_RE = re.compile(r"^\s*(\d+)\s*\([^)]*\)\s*$")
+
 
 def _canonical_track_code(track: str) -> Optional[str]:
     """Return canonical track code for case-insensitive input, else None."""
@@ -109,6 +113,23 @@ def _canonical_track_code(track: str) -> Optional[str]:
     if not normalized:
         return None
     return VALID_TRACK_MAP.get(normalized)
+
+
+def _normalize_team_name(value: Optional[str]) -> str:
+    """Normalize an opponent/team identifier.
+
+    Tags like "777 (Jackpot)" or "21 (Blackjack)" are reduced to just the
+    leading number, since that's how the team is identified elsewhere.
+    """
+    cleaned = (value or "").strip()
+    cleaned = cleaned.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ").strip()
+    cleaned = cleaned.strip("`").strip().strip('"').strip("'").strip()
+    if not cleaned:
+        return ""
+    tag_match = TEAM_NUMBER_TAG_RE.match(cleaned)
+    if tag_match:
+        return tag_match.group(1)
+    return cleaned.upper()
 
 
 def _reaction_slots_path() -> str:
@@ -301,7 +322,12 @@ def _parse_score_block(text: str) -> tuple[Optional[str], Optional[int], Optiona
     team_tokens = []
     score_tokens = []
     for line in summary_lines:
-        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", line):
+        tag_match = TEAM_NUMBER_TAG_RE.match(line)
+        if tag_match:
+            # A team tag like "777 (Jackpot)" is one team token (the number),
+            # not a separate score digit plus a stray name word.
+            team_tokens.append(tag_match.group(1))
+        elif re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", line):
             team_tokens.append(line)
         elif re.fullmatch(r"\d+", line):
             score_tokens.append(int(line))
@@ -779,25 +805,39 @@ async def reaction_schedule_loop():
     if not isinstance(REACTION_CONFIG.get("channel_id"), int):
         return
 
-    now_pt = datetime.now(PT_TZ)
-    await _ensure_daily_reaction_slots(now_pt)
+    # An unhandled exception here would silently cancel this whole loop
+    # (discord.py tasks.Loop stops on error), permanently breaking both the
+    # hourly reaction cleanup and the daily gather reset until a restart.
+    try:
+        now_pt = datetime.now(PT_TZ)
+        await _ensure_daily_reaction_slots(now_pt)
 
-    if now_pt.hour == 0 and now_pt.minute == 0:
-        date_key = now_pt.strftime("%Y-%m-%d")
-        if _LAST_MIDNIGHT_REACT_DATE != date_key:
-            await _run_daily_reaction_seed()
-            _LAST_MIDNIGHT_REACT_DATE = date_key
+        if now_pt.hour == 0 and now_pt.minute == 0:
+            date_key = now_pt.strftime("%Y-%m-%d")
+            if _LAST_MIDNIGHT_REACT_DATE != date_key:
+                await _run_daily_reaction_seed()
+                _LAST_MIDNIGHT_REACT_DATE = date_key
 
-    if now_pt.minute == 0:
-        hour_key = now_pt.strftime("%Y-%m-%d-%H")
-        if _LAST_CLEANUP_HOUR_KEY != hour_key:
-            await _run_hourly_reaction_cleanup(now_pt)
-            _LAST_CLEANUP_HOUR_KEY = hour_key
+        if now_pt.minute == 0:
+            hour_key = now_pt.strftime("%Y-%m-%d-%H")
+            if _LAST_CLEANUP_HOUR_KEY != hour_key:
+                await _run_hourly_reaction_cleanup(now_pt)
+                _LAST_CLEANUP_HOUR_KEY = hour_key
+    except Exception as exc:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] reaction_schedule_loop error: {exc!r}")
 
 
 @reaction_schedule_loop.before_loop
 async def before_reaction_schedule_loop():
     await bot.wait_until_ready()
+
+
+@reaction_schedule_loop.error  # type: ignore[arg-type]
+async def reaction_schedule_loop_error(exc: BaseException):
+    """Restart the loop instead of letting it die silently on an unhandled error."""
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] reaction_schedule_loop crashed: {exc!r}; restarting.")
+    if not reaction_schedule_loop.is_running():
+        reaction_schedule_loop.restart()
 
 
 # ── Google Sheets ──────────────────────────────────────────────────────────────
@@ -2013,6 +2053,76 @@ async def cmd_reactreset(ctx: commands.Context):
     )
 
 
+def _aggregate_track_stats_for_team(rd_records: list[dict], team: str) -> dict[str, dict[str, Any]]:
+    """Aggregate Race Details rows for one opponent/team into per-track stats."""
+    aggregate: dict[str, dict[str, Any]] = {}
+    for row in rd_records:
+        if _normalize_team_name(str(row.get("Opponent", ""))) != team:
+            continue
+        raw_track = str(row.get("Track", "")).strip()
+        track_name = _canonical_track_code(raw_track) or raw_track
+        if not track_name:
+            continue
+        net = _to_int(row.get("Net Score"))
+        if net is None:
+            continue
+        entry = aggregate.setdefault(track_name, {"times": 0, "net_total": 0})
+        entry["times"] += 1
+        entry["net_total"] += net
+    return aggregate
+
+
+def _best_worst_tracks_message(team: str, limit: int = 5) -> str:
+    """Build a best-5/worst-5 track recommendation block for a war opponent.
+
+    Uses this team's own race history when available, otherwise falls back
+    to overall Track Stats so a brand-new opponent still gets a suggestion.
+    """
+    try:
+        spreadsheet = get_spreadsheet()
+        rd_records = spreadsheet.worksheet("Race Details").get_all_records()
+    except Exception:
+        return ""
+
+    aggregate = _aggregate_track_stats_for_team(rd_records, team)
+    scope_label = f"vs `{team}`"
+
+    rows: list[tuple[str, float, int]] = []
+    if aggregate:
+        for track_name, data in aggregate.items():
+            times = int(data["times"])
+            avg = (data["net_total"] / times) if times else 0.0
+            rows.append((track_name, avg, times))
+    else:
+        try:
+            ts_records = spreadsheet.worksheet("Track Stats").get_all_records()
+        except Exception:
+            ts_records = []
+        for r in ts_records:
+            track_name = str(r.get("Track", "")).strip()
+            if not track_name:
+                continue
+            times = int(r.get("Times Played", 0) or 0)
+            avg = float(r.get("Avg per Race", 0) or 0)
+            rows.append((track_name, avg, times))
+        scope_label = "overall (no history vs this team yet)"
+
+    if not rows:
+        return ""
+
+    rows.sort(key=lambda r: r[1], reverse=True)
+    best = rows[:limit]
+    worst = list(reversed(rows[-limit:]))
+
+    lines = [f"\n📊 Track recommendations ({scope_label}):", "**What to pick:**"]
+    for track_name, avg, times in best:
+        lines.append(f"  • {track_name} (avg {avg:+.2f}, {times}x)")
+    lines.append("**What not to pick:**")
+    for track_name, avg, times in worst:
+        lines.append(f"  • {track_name} (avg {avg:+.2f}, {times}x)")
+    return "\n".join(lines)
+
+
 @bot.command(name="warstart")
 async def cmd_warstart(ctx: commands.Context, opponent: str):
     """
@@ -2020,18 +2130,20 @@ async def cmd_warstart(ctx: commands.Context, opponent: str):
     Usage: !warstart <opponent>
     """
     channel_id = ctx.channel.id
+    team = _normalize_team_name(opponent)
     _mark_runtime_mutation("warstart")
     ACTIVE_WARS[channel_id] = {
-        "opponent": opponent.strip().upper(),
+        "opponent": team,
         "races": {},
         "created_by": ctx.author.id,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
     await ctx.send(
-        f"✅ Started war vs `{opponent.strip().upper()}`.\n"
+        f"✅ Started war vs `{team}`.\n"
         "No race limit is enforced; keep entering races until `!warend`.\n"
         "Add race results with: `!warset <race> <net> <positions_csv>`\n"
         "Example: `!warset 1 +24 1,2,4,6,7,9`"
+        f"{_best_worst_tracks_message(team)}"
     )
 
 
@@ -2042,19 +2154,21 @@ async def cmd_warstart2(ctx: commands.Context, opponent: str):
     Usage: !warstart2 <opponent>
     """
     channel_id = ctx.channel.id
+    team = _normalize_team_name(opponent)
     _mark_runtime_mutation("warstart2")
     ACTIVE_WARS_T2[channel_id] = {
-        "opponent": opponent.strip().upper(),
+        "opponent": team,
         "races": {},
         "created_by": ctx.author.id,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }
     await ctx.send(
-        f"✅ [Team 2] Started war vs `{opponent.strip().upper()}`.\n"
+        f"✅ [Team 2] Started war vs `{team}`.\n"
         "No race limit is enforced; keep entering races until `!warend2`.\n"
         "Add race results with: `!warset2 <race> <net> <positions_csv>`\n"
         "Example: `!warset2 1 +24 1,2,4,6,7,9`\n"
         "Or use shorthand prefixed with `2 `, e.g. `2 AH 13478+`"
+        f"{_best_worst_tracks_message(team)}"
     )
 
 
@@ -2574,13 +2688,13 @@ async def cmd_trackstats(ctx: commands.Context, arg: Optional[str] = None):
             if not match:
                 # Fallback: interpret non-track token as opponent/team filter.
                 # Build stats from Race Details so filters are independent of global aggregate sheet.
-                team = arg_clean.upper()
+                team = _normalize_team_name(arg_clean)
                 rd = spreadsheet.worksheet("Race Details")
                 rd_records = rd.get_all_records()
                 team_rows = [
                     row
                     for row in rd_records
-                    if _clean_command_arg(str(row.get("Opponent", ""))).upper() == team
+                    if _normalize_team_name(str(row.get("Opponent", ""))) == team
                 ]
 
                 if not team_rows:
